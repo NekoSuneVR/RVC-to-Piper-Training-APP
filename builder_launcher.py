@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 from app import APP_DIR
 from piper_builder_gui import PiperBuilder
@@ -9,10 +8,19 @@ from piper_builder_gui import PiperBuilder
 
 TRAINER_SETUP = APP_DIR / "setup-piper-training.ps1"
 TRAINER_MARKER = APP_DIR / "tools" / "piper-trainer" / ".setup-complete"
+REQUIRED_TRAINER_MARKER = "piper-trainer-v6"
 
 
 class GuardedPiperBuilder(PiperBuilder):
     """Builder that bootstraps and repairs the Piper training environment when needed."""
+
+    def _marker_current(self) -> bool:
+        if not TRAINER_MARKER.is_file():
+            return False
+        try:
+            return TRAINER_MARKER.read_text(encoding="utf-8-sig").strip().startswith(REQUIRED_TRAINER_MARKER)
+        except OSError:
+            return False
 
     def _trainer_ready(self) -> bool:
         plan = self._plan()
@@ -28,7 +36,7 @@ class GuardedPiperBuilder(PiperBuilder):
             and has_espeak_bridge
             and has_alignment
             and has_espeak_data
-            and TRAINER_MARKER.is_file()
+            and self._marker_current()
         )
 
     def _missing_trainer_parts(self) -> list[str]:
@@ -47,8 +55,17 @@ class GuardedPiperBuilder(PiperBuilder):
             missing.append(f"Piper eSpeak data: {piper_dir / 'espeak-ng-data'}")
         if not any(nested_align_dir.glob("core*.pyd")):
             missing.append(f"Piper nested monotonic alignment extension: {nested_align_dir / 'core*.pyd'}")
-        if not TRAINER_MARKER.is_file():
-            missing.append(f"Successful trainer setup marker: {TRAINER_MARKER}")
+        if not self._marker_current():
+            if TRAINER_MARKER.is_file():
+                try:
+                    found = TRAINER_MARKER.read_text(encoding="utf-8-sig").strip().split(";", 1)[0]
+                except OSError:
+                    found = "unreadable marker"
+                missing.append(
+                    f"Current trainer setup marker {REQUIRED_TRAINER_MARKER} (found {found}): {TRAINER_MARKER}"
+                )
+            else:
+                missing.append(f"Successful trainer setup marker {REQUIRED_TRAINER_MARKER}: {TRAINER_MARKER}")
         return missing
 
     def _install_trainer_sync(self) -> None:
@@ -60,10 +77,10 @@ class GuardedPiperBuilder(PiperBuilder):
         accelerator = str(self._vars["accelerator"].get()).strip().lower()
         engine = "cpu" if accelerator == "cpu" else "cuda"
         missing_before = self._missing_trainer_parts()
-        self.events.put(("status", "Piper trainer is incomplete. Repairing it first…"))
+        self.events.put(("status", "Piper trainer is incomplete or outdated. Repairing it first…"))
         self.events.put(("log", "Piper trainer readiness check failed; starting automatic repair."))
         for item in missing_before:
-            self.events.put(("log", f"Missing: {item}"))
+            self.events.put(("log", f"Missing/outdated: {item}"))
         self.events.put(("log", f"Selected trainer engine: {engine}"))
 
         command = [
