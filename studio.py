@@ -14,6 +14,7 @@ TRAINER_ROOT = APP_DIR / "tools" / "piper-trainer"
 TRAINER_PYTHON = TRAINER_ROOT / ".venv" / "Scripts" / "python.exe"
 TRAINER_SOURCE = TRAINER_ROOT / "piper1-gpl"
 TRAINER_MARKER = TRAINER_ROOT / ".setup-complete"
+REQUIRED_TRAINER_MARKER = "piper-trainer-v6"
 PROMPTS_FILE = APP_DIR / "data" / "piper_training_prompts.txt"
 BUILDER_LAUNCHER = APP_DIR / "builder_launcher.py"
 
@@ -166,12 +167,20 @@ class Studio(BaseStudio):
         except tk.TclError:
             pass
 
+    def _trainer_marker_current(self) -> bool:
+        if not TRAINER_MARKER.is_file():
+            return False
+        try:
+            return TRAINER_MARKER.read_text(encoding="utf-8-sig").strip().startswith(REQUIRED_TRAINER_MARKER)
+        except OSError:
+            return False
+
     def _trainer_ready(self) -> bool:
         piper_dir = TRAINER_SOURCE / "src" / "piper"
         nested_align = piper_dir / "train" / "vits" / "monotonic_align" / "monotonic_align"
         return (
             TRAINER_PYTHON.is_file()
-            and TRAINER_MARKER.is_file()
+            and self._trainer_marker_current()
             and (piper_dir / "train").is_dir()
             and (piper_dir / "espeak-ng-data").is_dir()
             and any(piper_dir.glob("espeakbridge*.pyd"))
@@ -189,7 +198,7 @@ class Studio(BaseStudio):
         lines = [
             f"{'✓' if rvc_ready else '✗'} RVC voice model: {rvc_model if rvc_model else 'not selected'}",
             f"{'✓' if index_ready else '•'} RVC feature index: {settings.rvc_index if settings.rvc_index else 'optional / not selected'}",
-            f"{'✓' if trainer_ready else '✗'} Piper training environment: {'installed and verified' if trainer_ready else 'missing / incomplete'}",
+            f"{'✓' if trainer_ready else '✗'} Piper training environment: {'installed and verified' if trainer_ready else 'missing / outdated / incomplete'}",
             f"{'✓' if prompts_ready else '✗'} Training prompts: {PROMPTS_FILE}",
         ]
         if rvc_ready and trainer_ready and prompts_ready:
