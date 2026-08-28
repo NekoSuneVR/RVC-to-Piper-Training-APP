@@ -192,39 +192,78 @@ function Test-TorchCudaKernel([string]$PythonExe) {
   return ($ExitCode -eq 0)
 }
 
+function Install-LegacyScientificStack([string]$PythonExe) {
+  Write-Host 'Installing matched scientific stack for legacy CUDA training...' -ForegroundColor Cyan
+  Invoke-Checked {
+    & $PythonExe -m pip install --upgrade --force-reinstall --no-cache-dir `
+      'numpy==1.26.4' `
+      'scipy==1.13.1' `
+      'ml-dtypes==0.5.1' `
+      'onnx==1.17.0'
+  } 'Legacy scientific stack installation'
+
+  Write-Host 'Pinning Lightning stack for PyTorch 2.3.1...' -ForegroundColor Cyan
+  Invoke-Checked {
+    & $PythonExe -m pip install --upgrade --force-reinstall --no-cache-dir `
+      'lightning==2.4.0' `
+      'pytorch-lightning==2.4.0' `
+      'torchmetrics==1.4.3'
+  } 'Legacy Lightning stack installation'
+
+  Write-Host 'Verifying the legacy scientific Python stack...' -ForegroundColor Cyan
+  Invoke-Checked {
+    & $PythonExe -W ignore -c "import numpy, scipy, ml_dtypes, onnx, lightning, pytorch_lightning, torchmetrics; print('numpy', numpy.__version__); print('scipy', scipy.__version__); print('ml_dtypes', ml_dtypes.__version__); print('onnx', onnx.__version__); print('lightning', lightning.__version__); print('pytorch_lightning', pytorch_lightning.__version__); print('torchmetrics', torchmetrics.__version__)"
+  } 'Legacy scientific stack import verification'
+
+  Invoke-Checked { & $PythonExe -m pip check } 'Piper trainer dependency consistency check'
+}
+
 function Ensure-CudaTorch([string]$PythonExe) {
   Write-Host 'Checking the installed PyTorch CUDA build with a real GPU kernel...' -ForegroundColor Cyan
   $CapabilityCode = Get-CudaCapabilityCode -PythonExe $PythonExe
+  $KernelWorks = Test-TorchCudaKernel -PythonExe $PythonExe
 
-  if (Test-TorchCudaKernel -PythonExe $PythonExe) {
+  if (($CapabilityCode -gt 0) -and ($CapabilityCode -lt 75)) {
+    Write-Host "Detected legacy NVIDIA compute capability $CapabilityCode. Using the legacy CUDA compatibility stack." -ForegroundColor Yellow
+
+    $LegacyTorchReady = $false
+    $PreviousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      & $PythonExe -W ignore -c "import torch,sys; ok=torch.__version__.startswith('2.3.1') and torch.version.cuda=='11.8'; print('legacy_torch_ready', ok); sys.exit(0 if ok else 1)" 2>&1 |
+        ForEach-Object { Write-Host $_ }
+      $LegacyTorchReady = ($LASTEXITCODE -eq 0)
+    } finally {
+      $ErrorActionPreference = $PreviousPreference
+    }
+
+    if (-not $LegacyTorchReady) {
+      Write-Host 'Installing Maxwell/Pascal/Volta-compatible PyTorch 2.3.1 + CUDA 11.8...' -ForegroundColor Cyan
+      Invoke-Checked {
+        & $PythonExe -m pip install --upgrade --force-reinstall --no-cache-dir 'torch==2.3.1' --index-url https://download.pytorch.org/whl/cu118
+      } 'Legacy-compatible CUDA PyTorch installation'
+    } else {
+      Write-Host 'Legacy-compatible PyTorch 2.3.1 + CUDA 11.8 is already installed.' -ForegroundColor DarkGreen
+    }
+
+    Install-LegacyScientificStack -PythonExe $PythonExe
+
+    Write-Host 'Verifying legacy CUDA kernel execution...' -ForegroundColor Cyan
+    if (-not (Test-TorchCudaKernel -PythonExe $PythonExe)) {
+      throw 'Legacy PyTorch is installed but still cannot execute a CUDA kernel on this GPU. Select Device=cpu or verify the NVIDIA driver.'
+    }
+    return
+  }
+
+  if ($KernelWorks) {
     Write-Host 'Existing PyTorch CUDA build can execute kernels on this GPU.' -ForegroundColor DarkGreen
     return
   }
 
-  if (($CapabilityCode -gt 0) -and ($CapabilityCode -lt 75)) {
-    Write-Host "Detected legacy NVIDIA compute capability $CapabilityCode. Modern CUDA wheels no longer cover this GPU." -ForegroundColor Yellow
-    Write-Host 'Installing Maxwell/Pascal/Volta-compatible PyTorch 2.3.1 + CUDA 11.8...' -ForegroundColor Cyan
-    Invoke-Checked {
-      & $PythonExe -m pip install --upgrade --force-reinstall --no-cache-dir 'torch==2.3.1' --index-url https://download.pytorch.org/whl/cu118
-    } 'Legacy-compatible CUDA PyTorch installation'
-
-    # Torch 2.3.x predates the NumPy 2 ABI. Keep this environment on the latest
-    # Python 3.12-compatible NumPy 1.x release to avoid native ABI failures.
-    Write-Host 'Pinning NumPy for the legacy PyTorch build...' -ForegroundColor Cyan
-    Invoke-Checked {
-      & $PythonExe -m pip install --upgrade --force-reinstall 'numpy==1.26.4'
-    } 'Legacy-compatible NumPy installation'
-
-    Write-Host 'Pinning Lightning to a Python 3.12 / Torch 2.3 compatible release line...' -ForegroundColor Cyan
-    Invoke-Checked {
-      & $PythonExe -m pip install --upgrade 'lightning>=2.4,<2.5'
-    } 'Legacy-compatible Lightning installation'
-  } else {
-    Write-Host 'Current CUDA build failed its kernel test. Reinstalling the CUDA 12.8 PyTorch wheel...' -ForegroundColor Yellow
-    Invoke-Checked {
-      & $PythonExe -m pip install --upgrade --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128
-    } 'CUDA PyTorch installation'
-  }
+  Write-Host 'Current CUDA build failed its kernel test. Reinstalling the CUDA 12.8 PyTorch wheel...' -ForegroundColor Yellow
+  Invoke-Checked {
+    & $PythonExe -m pip install --upgrade --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128
+  } 'CUDA PyTorch installation'
 
   Write-Host 'Verifying the replacement PyTorch build...' -ForegroundColor Cyan
   Invoke-Checked {
@@ -305,10 +344,12 @@ Build-PiperMonotonicAlignment -AlignDir $AlignDir -PythonExe $TrainerPython
 
 Write-Host 'Verifying Piper trainer, eSpeak phonemizer and native extensions...' -ForegroundColor Cyan
 Invoke-Checked {
-  & $TrainerPython -W ignore -c "import torch; import piper.train; from piper.phonemize_espeak import EspeakPhonemizer; p=EspeakPhonemizer(); assert p.phonemize('en-GB-x-rp','Piper trainer verification.'); from piper.train.vits.monotonic_align.monotonic_align.core import maximum_path_c; from piper.train.vits.monotonic_align import maximum_path; print('espeak_voice', 'en-GB-x-rp'); print('espeakbridge_ok', True); print('alignment_ok', True); print('torch', torch.__version__); print('torch_cuda_runtime', torch.version.cuda); print('cuda_available', torch.cuda.is_available())"
+  & $TrainerPython -W ignore -c "import numpy, scipy, torch; import lightning, pytorch_lightning, torchmetrics; import piper.train; from piper.phonemize_espeak import EspeakPhonemizer; p=EspeakPhonemizer(); assert p.phonemize('en-GB-x-rp','Piper trainer verification.'); from piper.train.vits.monotonic_align.monotonic_align.core import maximum_path_c; from piper.train.vits.monotonic_align import maximum_path; print('espeak_voice', 'en-GB-x-rp'); print('espeakbridge_ok', True); print('alignment_ok', True); print('numpy', numpy.__version__); print('scipy', scipy.__version__); print('torch', torch.__version__); print('torch_cuda_runtime', torch.version.cuda); print('cuda_available', torch.cuda.is_available()); print('lightning', lightning.__version__); print('pytorch_lightning', pytorch_lightning.__version__); print('torchmetrics', torchmetrics.__version__)"
 } 'Piper trainer verification'
 
-Set-Content -LiteralPath $Marker -Encoding UTF8 -Value "piper-trainer-v5; engine=$Engine; completed=$(Get-Date -Format o); source=https://github.com/OHF-Voice/piper1-gpl"
+Invoke-Checked { & $TrainerPython -m pip check } 'Final Piper trainer dependency check'
+
+Set-Content -LiteralPath $Marker -Encoding UTF8 -Value "piper-trainer-v6; engine=$Engine; completed=$(Get-Date -Format o); source=https://github.com/OHF-Voice/piper1-gpl"
 
 Write-Host ''
 Write-Host 'Piper trainer is ready.' -ForegroundColor Green
