@@ -39,6 +39,50 @@ function Test-CppBuildTools {
   return [bool]$InstallPath
 }
 
+function Build-PiperMonotonicAlignment([string]$AlignDir, [string]$PythonExe) {
+  # Piper's setup.py passes an absolute path to core.pyx into Cython. On Windows,
+  # setuptools mirrors that path below build\temp when creating core.obj. If the
+  # app itself lives in a deep folder, MSVC can fail with C1083 / Invalid argument.
+  # Build from a deliberately short temporary path, then copy the compiled .pyd
+  # back into Piper's real package directory.
+  $ShortBuild = Join-Path $env:TEMP ("pma-" + $PID)
+  if (Test-Path $ShortBuild) {
+    Remove-Item -LiteralPath $ShortBuild -Recurse -Force
+  }
+  New-Item -ItemType Directory -Force -Path $ShortBuild | Out-Null
+
+  try {
+    Copy-Item -LiteralPath (Join-Path $AlignDir 'setup.py') -Destination (Join-Path $ShortBuild 'setup.py') -Force
+    Copy-Item -LiteralPath (Join-Path $AlignDir 'core.pyx') -Destination (Join-Path $ShortBuild 'core.pyx') -Force
+
+    Write-Host "Compiling from short path: $ShortBuild" -ForegroundColor DarkCyan
+    Push-Location $ShortBuild
+    try {
+      Invoke-Checked {
+        & $PythonExe setup.py build_ext --inplace --build-temp (Join-Path $ShortBuild 'obj')
+      } 'Piper monotonic alignment build'
+    } finally {
+      Pop-Location
+    }
+
+    $BuiltCore = Get-ChildItem -LiteralPath $ShortBuild -Filter 'core*.pyd' -File |
+      Sort-Object LastWriteTime -Descending |
+      Select-Object -First 1
+    if (-not $BuiltCore) {
+      throw "Piper monotonic alignment compiled without producing core*.pyd in $ShortBuild"
+    }
+
+    Get-ChildItem -LiteralPath $AlignDir -Filter 'core*.pyd' -File -ErrorAction SilentlyContinue |
+      Remove-Item -Force -ErrorAction SilentlyContinue
+    Copy-Item -LiteralPath $BuiltCore.FullName -Destination (Join-Path $AlignDir $BuiltCore.Name) -Force
+    Write-Host "Installed compiled alignment extension: $($BuiltCore.Name)" -ForegroundColor Green
+  } finally {
+    if (Test-Path $ShortBuild) {
+      Remove-Item -LiteralPath $ShortBuild -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
 New-Item -ItemType Directory -Force -Path $TrainerRoot | Out-Null
 
 if (-not (Test-Path $AppPython)) {
@@ -98,12 +142,7 @@ if ($Engine -eq 'cuda') {
 
 $AlignDir = Join-Path $Source 'src\piper\train\vits\monotonic_align'
 Write-Host 'Building Piper monotonic alignment extension...' -ForegroundColor Cyan
-Push-Location $AlignDir
-try {
-  Invoke-Checked { & $TrainerPython setup.py build_ext --inplace } 'Piper monotonic alignment build'
-} finally {
-  Pop-Location
-}
+Build-PiperMonotonicAlignment -AlignDir $AlignDir -PythonExe $TrainerPython
 
 Write-Host 'Verifying Piper trainer...' -ForegroundColor Cyan
 Invoke-Checked {
