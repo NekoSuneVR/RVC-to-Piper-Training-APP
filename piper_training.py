@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+TRAIN_WRAPPER = Path(__file__).resolve().with_name("piper_train_wrapper.py")
+
 ESPEAK_VOICE_ALIASES = {
     "en-gb": "en-GB-x-rp",
     "en_gb": "en-GB-x-rp",
@@ -116,7 +118,8 @@ def training_command(plan: PiperTrainPlan) -> list[str]:
     espeak_voice = normalize_espeak_voice(plan.espeak_voice)
     command = [
         str(plan.trainer_python),
-        "-m", "piper.train", "fit",
+        str(TRAIN_WRAPPER),
+        "fit",
         "--data.voice_name", plan.voice_name,
         "--data.csv_path", str(plan.metadata_csv),
         "--data.audio_dir", str(plan.audio_dir),
@@ -158,6 +161,8 @@ def validate_trainer(plan: PiperTrainPlan) -> list[str]:
         errors.append(f"Piper trainer Python not found: {plan.trainer_python}")
     if not (plan.trainer_source / "src" / "piper" / "train").is_dir():
         errors.append(f"Piper training source not found: {plan.trainer_source}")
+    if not TRAIN_WRAPPER.is_file():
+        errors.append(f"Piper training wrapper not found: {TRAIN_WRAPPER}")
     if not plan.metadata_csv.is_file():
         errors.append(f"Dataset metadata not found: {plan.metadata_csv}")
     if not plan.audio_dir.is_dir():
