@@ -221,15 +221,30 @@ class PiperBuilder(tk.Tk):
             messagebox.showerror("Missing setup script", f"Could not find {script}")
             return
 
+        accelerator = str(self._vars.get("accelerator", tk.StringVar(value="auto")).get()).strip().lower()
+        engine = "cpu" if accelerator == "cpu" else "cuda"
+
         def worker():
             try:
-                command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)]
+                command = [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script),
+                    "-Engine",
+                    engine,
+                    "-InstallBuildTools",
+                ]
+                self.events.put(("log", f"Trainer engine selected: {engine}"))
+                self.events.put(("log", "Missing Microsoft C++ Build Tools will be installed automatically with winget."))
                 self._run_stream(command, APP_DIR)
-                self.events.put(("complete", "Piper training environment is ready."))
+                self.events.put(("complete", "Piper training environment is ready. Close/reopen Studio or press Refresh on tab 3."))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
 
-        self._start(worker, "Installing the Piper training environment…")
+        self._start(worker, "Installing Piper trainer and required Windows build tools…")
 
     def build_dataset(self) -> None:
         def worker():
