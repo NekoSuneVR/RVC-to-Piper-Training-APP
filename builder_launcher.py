@@ -8,17 +8,46 @@ from piper_builder_gui import PiperBuilder
 
 
 TRAINER_SETUP = APP_DIR / "setup-piper-training.ps1"
+TRAINER_MARKER = APP_DIR / "tools" / "piper-trainer" / ".setup-complete"
 
 
 class GuardedPiperBuilder(PiperBuilder):
-    """Builder that bootstraps the Piper training environment when needed."""
+    """Builder that bootstraps and repairs the Piper training environment when needed."""
 
     def _trainer_ready(self) -> bool:
         plan = self._plan()
+        piper_dir = plan.trainer_source / "src" / "piper"
+        align_dir = piper_dir / "train" / "vits" / "monotonic_align"
+        has_espeak_bridge = any(piper_dir.glob("espeakbridge*.pyd"))
+        has_alignment = any(align_dir.glob("core*.pyd"))
+        has_espeak_data = (piper_dir / "espeak-ng-data").is_dir()
         return (
             plan.trainer_python.is_file()
-            and (plan.trainer_source / "src" / "piper" / "train").is_dir()
+            and (piper_dir / "train").is_dir()
+            and has_espeak_bridge
+            and has_alignment
+            and has_espeak_data
+            and TRAINER_MARKER.is_file()
         )
+
+    def _missing_trainer_parts(self) -> list[str]:
+        plan = self._plan()
+        piper_dir = plan.trainer_source / "src" / "piper"
+        align_dir = piper_dir / "train" / "vits" / "monotonic_align"
+        missing: list[str] = []
+        if not plan.trainer_python.is_file():
+            missing.append(f"Piper trainer Python: {plan.trainer_python}")
+        if not (piper_dir / "train").is_dir():
+            missing.append(f"Piper training source: {plan.trainer_source}")
+        if not any(piper_dir.glob("espeakbridge*.pyd")):
+            missing.append(f"Piper eSpeak native bridge: {piper_dir / 'espeakbridge*.pyd'}")
+        if not (piper_dir / "espeak-ng-data").is_dir():
+            missing.append(f"Piper eSpeak data: {piper_dir / 'espeak-ng-data'}")
+        if not any(align_dir.glob("core*.pyd")):
+            missing.append(f"Piper monotonic alignment extension: {align_dir / 'core*.pyd'}")
+        if not TRAINER_MARKER.is_file():
+            missing.append(f"Successful trainer setup marker: {TRAINER_MARKER}")
+        return missing
 
     def _install_trainer_sync(self) -> None:
         if self._trainer_ready():
@@ -28,8 +57,11 @@ class GuardedPiperBuilder(PiperBuilder):
 
         accelerator = str(self._vars["accelerator"].get()).strip().lower()
         engine = "cpu" if accelerator == "cpu" else "cuda"
-        self.events.put(("status", "Piper trainer is missing. Installing it first…"))
-        self.events.put(("log", "Piper trainer environment was not found; starting automatic bootstrap."))
+        missing_before = self._missing_trainer_parts()
+        self.events.put(("status", "Piper trainer is incomplete. Repairing it first…"))
+        self.events.put(("log", "Piper trainer readiness check failed; starting automatic repair."))
+        for item in missing_before:
+            self.events.put(("log", f"Missing: {item}"))
         self.events.put(("log", f"Selected trainer engine: {engine}"))
 
         command = [
@@ -46,16 +78,10 @@ class GuardedPiperBuilder(PiperBuilder):
         self._run_stream(command, APP_DIR)
 
         if not self._trainer_ready():
-            plan = self._plan()
-            missing = []
-            if not plan.trainer_python.is_file():
-                missing.append(f"Piper trainer Python not found after setup: {plan.trainer_python}")
-            train_source = plan.trainer_source / "src" / "piper" / "train"
-            if not train_source.is_dir():
-                missing.append(f"Piper training source not found after setup: {plan.trainer_source}")
-            raise RuntimeError("Trainer setup finished but is incomplete:\n" + "\n".join(missing))
+            missing = self._missing_trainer_parts()
+            raise RuntimeError("Trainer repair finished but is still incomplete:\n" + "\n".join(missing))
 
-        self.events.put(("log", "Piper trainer bootstrap completed successfully."))
+        self.events.put(("log", "Piper trainer repair completed successfully."))
 
     def install_trainer(self) -> None:
         def worker():
@@ -65,7 +91,7 @@ class GuardedPiperBuilder(PiperBuilder):
             except Exception as exc:
                 self.events.put(("error", str(exc)))
 
-        self._start(worker, "Installing Piper trainer and required Windows build tools…")
+        self._start(worker, "Installing / repairing Piper trainer and native extensions…")
 
     def train(self) -> None:
         def worker():
@@ -126,7 +152,6 @@ def main() -> None:
     }
     action = actions.get(args.action)
     if action is not None:
-        # Give Tk a moment to finish drawing the builder before a long task starts.
         app.after(350, action)
     app.mainloop()
 
