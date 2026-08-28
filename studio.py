@@ -10,7 +10,10 @@ from app import APP_DIR, Settings, Studio as BaseStudio
 
 
 TRAINING_ROOT = APP_DIR / "training"
-TRAINER_PYTHON = APP_DIR / "tools" / "piper-trainer" / ".venv" / "Scripts" / "python.exe"
+TRAINER_ROOT = APP_DIR / "tools" / "piper-trainer"
+TRAINER_PYTHON = TRAINER_ROOT / ".venv" / "Scripts" / "python.exe"
+TRAINER_SOURCE = TRAINER_ROOT / "piper1-gpl"
+TRAINER_MARKER = TRAINER_ROOT / ".setup-complete"
 PROMPTS_FILE = APP_DIR / "data" / "piper_training_prompts.txt"
 BUILDER_LAUNCHER = APP_DIR / "builder_launcher.py"
 
@@ -163,24 +166,36 @@ class Studio(BaseStudio):
         except tk.TclError:
             pass
 
+    def _trainer_ready(self) -> bool:
+        piper_dir = TRAINER_SOURCE / "src" / "piper"
+        nested_align = piper_dir / "train" / "vits" / "monotonic_align" / "monotonic_align"
+        return (
+            TRAINER_PYTHON.is_file()
+            and TRAINER_MARKER.is_file()
+            and (piper_dir / "train").is_dir()
+            and (piper_dir / "espeak-ng-data").is_dir()
+            and any(piper_dir.glob("espeakbridge*.pyd"))
+            and any(nested_align.glob("core*.pyd"))
+        )
+
     def _refresh_builder_readiness(self) -> None:
         settings = Settings.load()
         rvc_model = Path(settings.rvc_model) if settings.rvc_model else None
         rvc_ready = bool(rvc_model and rvc_model.is_file())
         index_ready = bool(settings.rvc_index and Path(settings.rvc_index).is_file())
-        trainer_ready = TRAINER_PYTHON.is_file()
+        trainer_ready = self._trainer_ready()
         prompts_ready = PROMPTS_FILE.is_file()
 
         lines = [
             f"{'✓' if rvc_ready else '✗'} RVC voice model: {rvc_model if rvc_model else 'not selected'}",
             f"{'✓' if index_ready else '•'} RVC feature index: {settings.rvc_index if settings.rvc_index else 'optional / not selected'}",
-            f"{'✓' if trainer_ready else '✗'} Piper training environment: {'installed' if trainer_ready else 'not installed yet'}",
+            f"{'✓' if trainer_ready else '✗'} Piper training environment: {'installed and verified' if trainer_ready else 'missing / incomplete'}",
             f"{'✓' if prompts_ready else '✗'} Training prompts: {PROMPTS_FILE}",
         ]
         if rvc_ready and trainer_ready and prompts_ready:
             lines.append("\nReady to build. You can use BUILD EVERYTHING.")
         elif rvc_ready and prompts_ready:
-            lines.append("\nInstall the Piper trainer first, then build.")
+            lines.append("\nInstall / repair the Piper trainer first, then build.")
         else:
             lines.append("\nFinish Models & Setup first, then return here.")
         self.builder_readiness.configure(text="\n".join(lines))
