@@ -20,6 +20,11 @@ def main() -> None:
         for callback in callbacks
         if getattr(callback, "monitor", None) != "val_mos"
     ]
+    print(
+        "Piper Studio checkpoint mode: val_mel + last.ckpt "
+        "(optional val_mos/UTMOS checkpoint disabled).",
+        flush=True,
+    )
     piper_train_main.main()
 
 
