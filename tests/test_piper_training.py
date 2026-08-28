@@ -6,6 +6,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from piper_training import (
     PiperTrainPlan,
+    TRAIN_WRAPPER,
     export_command,
     latest_checkpoint,
     load_prompts,
@@ -46,7 +47,8 @@ class PiperTrainingTests(unittest.TestCase):
                 checkpoint=root / "base.ckpt",
             )
             command = training_command(plan)
-            self.assertEqual(command[1:4], ["-m", "piper.train", "fit"])
+            self.assertEqual(command[1], str(TRAIN_WRAPPER))
+            self.assertEqual(command[2], "fit")
             self.assertIn("--data.csv_path", command)
             self.assertIn("--ckpt_path", command)
             voice_index = command.index("--data.espeak_voice") + 1
