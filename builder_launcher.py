@@ -68,8 +68,8 @@ class GuardedPiperBuilder(PiperBuilder):
                 missing.append(f"Successful trainer setup marker {REQUIRED_TRAINER_MARKER}: {TRAINER_MARKER}")
         return missing
 
-    def _install_trainer_sync(self) -> None:
-        if self._trainer_ready():
+    def _install_trainer_sync(self, force: bool = False) -> None:
+        if self._trainer_ready() and not force:
             return
         if not TRAINER_SETUP.is_file():
             raise RuntimeError(f"Piper trainer setup script not found: {TRAINER_SETUP}")
@@ -77,10 +77,14 @@ class GuardedPiperBuilder(PiperBuilder):
         accelerator = str(self._vars["accelerator"].get()).strip().lower()
         engine = "cpu" if accelerator == "cpu" else "cuda"
         missing_before = self._missing_trainer_parts()
-        self.events.put(("status", "Piper trainer is incomplete or outdated. Repairing it first…"))
-        self.events.put(("log", "Piper trainer readiness check failed; starting automatic repair."))
-        for item in missing_before:
-            self.events.put(("log", f"Missing/outdated: {item}"))
+        if force and not missing_before:
+            self.events.put(("status", "Re-verifying and repairing the Piper trainer…"))
+            self.events.put(("log", "Forced trainer repair requested; re-running dependency and native-extension verification."))
+        else:
+            self.events.put(("status", "Piper trainer is incomplete or outdated. Repairing it first…"))
+            self.events.put(("log", "Piper trainer readiness check failed; starting automatic repair."))
+            for item in missing_before:
+                self.events.put(("log", f"Missing/outdated: {item}"))
         self.events.put(("log", f"Selected trainer engine: {engine}"))
 
         command = [
@@ -105,7 +109,7 @@ class GuardedPiperBuilder(PiperBuilder):
     def install_trainer(self) -> None:
         def worker():
             try:
-                self._install_trainer_sync()
+                self._install_trainer_sync(force=True)
                 self.events.put(("complete", "Piper training environment is ready."))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
