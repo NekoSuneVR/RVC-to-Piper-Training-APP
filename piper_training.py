@@ -6,6 +6,24 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+ESPEAK_VOICE_ALIASES = {
+    "en-gb": "en-GB-x-rp",
+    "en_gb": "en-GB-x-rp",
+    "en-uk": "en-GB-x-rp",
+    "en_uk": "en-GB-x-rp",
+    "en-us": "en-US",
+    "en_us": "en-US",
+}
+
+
+def normalize_espeak_voice(value: str) -> str:
+    """Convert friendly language aliases to eSpeak voice identifiers."""
+    value = value.strip()
+    if not value:
+        return "en-GB-x-rp"
+    return ESPEAK_VOICE_ALIASES.get(value.lower(), value)
+
+
 @dataclass(frozen=True)
 class PiperTrainPlan:
     voice_name: str
@@ -95,6 +113,7 @@ def write_metadata(path: Path, rows: list[tuple[str, str]]) -> None:
 
 
 def training_command(plan: PiperTrainPlan) -> list[str]:
+    espeak_voice = normalize_espeak_voice(plan.espeak_voice)
     command = [
         str(plan.trainer_python),
         "-m", "piper.train", "fit",
@@ -102,7 +121,7 @@ def training_command(plan: PiperTrainPlan) -> list[str]:
         "--data.csv_path", str(plan.metadata_csv),
         "--data.audio_dir", str(plan.audio_dir),
         "--model.sample_rate", str(plan.sample_rate),
-        "--data.espeak_voice", plan.espeak_voice,
+        "--data.espeak_voice", espeak_voice,
         "--data.cache_dir", str(plan.cache_dir),
         "--data.config_path", str(plan.config_path),
         "--data.batch_size", str(plan.batch_size),
