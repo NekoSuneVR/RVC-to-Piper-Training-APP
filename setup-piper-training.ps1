@@ -152,10 +152,6 @@ function Build-PiperMonotonicAlignment([string]$AlignDir, [string]$PythonExe) {
 }
 
 function Get-CudaCapabilityCode([string]$PythonExe) {
-  # Windows PowerShell 5.1 turns native stderr into NativeCommandError records.
-  # PyTorch emits a warning for unsupported legacy GPUs before we have a chance
-  # to replace the wheel, so temporarily allow native stderr and suppress Python
-  # warnings for this capability-only probe.
   $PreviousPreference = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   try {
@@ -173,9 +169,6 @@ function Get-CudaCapabilityCode([string]$PythonExe) {
 }
 
 function Test-TorchCudaKernel([string]$PythonExe) {
-  # Do not let Windows PowerShell convert a PyTorch warning/runtime message on
-  # stderr into a terminating NativeCommandError. The Python process exit code
-  # is the source of truth for this diagnostic.
   $PreviousPreference = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   try {
@@ -204,7 +197,7 @@ function Install-LegacyScientificStack([string]$PythonExe) {
 
   Write-Host 'Pinning Lightning stack for PyTorch 2.3.1...' -ForegroundColor Cyan
   Invoke-Checked {
-    & $PythonExe -m pip install --upgrade --force-reinstall --no-cache-dir `
+    & $PythonExe -m pip install --upgrade `
       'lightning==2.4.0' `
       'pytorch-lightning==2.4.0' `
       'torchmetrics==1.4.3'
