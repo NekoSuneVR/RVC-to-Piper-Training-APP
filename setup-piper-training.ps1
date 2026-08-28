@@ -100,10 +100,10 @@ function Build-PiperEspeakBridge([string]$SourceDir, [string]$PythonExe) {
 
 function Build-PiperMonotonicAlignment([string]$AlignDir, [string]$PythonExe) {
   # Piper's setup.py passes an absolute path to core.pyx into Cython. On Windows,
-  # setuptools mirrors that path below build\temp when creating core.obj. If the
-  # app itself lives in a deep folder, MSVC can fail with C1083 / Invalid argument.
-  # Build from a deliberately short temporary path, then copy the compiled .pyd
-  # back into Piper's real package directory.
+  # setuptools mirrors that path below build\temp when creating core.obj. Build
+  # from a deliberately short temporary path to avoid C1083/path-length failures.
+  # Piper's current __init__.py imports .monotonic_align.core, so install the
+  # extension into that nested package as well as the outer folder.
   $ShortBuild = Join-Path $env:TEMP ("pma-" + $PID)
   if (Test-Path $ShortBuild) {
     Remove-Item -LiteralPath $ShortBuild -Recurse -Force
@@ -134,7 +134,16 @@ function Build-PiperMonotonicAlignment([string]$AlignDir, [string]$PythonExe) {
     Get-ChildItem -LiteralPath $AlignDir -Filter 'core*.pyd' -File -ErrorAction SilentlyContinue |
       Remove-Item -Force -ErrorAction SilentlyContinue
     Copy-Item -LiteralPath $BuiltCore.FullName -Destination (Join-Path $AlignDir $BuiltCore.Name) -Force
+
+    $NestedAlign = Join-Path $AlignDir 'monotonic_align'
+    New-Item -ItemType Directory -Force -Path $NestedAlign | Out-Null
+    Set-Content -LiteralPath (Join-Path $NestedAlign '__init__.py') -Encoding UTF8 -Value '# Native Piper monotonic alignment extension package.'
+    Get-ChildItem -LiteralPath $NestedAlign -Filter 'core*.pyd' -File -ErrorAction SilentlyContinue |
+      Remove-Item -Force -ErrorAction SilentlyContinue
+    Copy-Item -LiteralPath $BuiltCore.FullName -Destination (Join-Path $NestedAlign $BuiltCore.Name) -Force
+
     Write-Host "Installed compiled alignment extension: $($BuiltCore.Name)" -ForegroundColor Green
+    Write-Host "Installed Piper-compatible nested alignment package: $NestedAlign" -ForegroundColor Green
   } finally {
     if (Test-Path $ShortBuild) {
       Remove-Item -LiteralPath $ShortBuild -Recurse -Force -ErrorAction SilentlyContinue
@@ -142,27 +151,54 @@ function Build-PiperMonotonicAlignment([string]$AlignDir, [string]$PythonExe) {
   }
 }
 
-function Ensure-CudaTorch([string]$PythonExe) {
-  Write-Host 'Checking whether PyTorch is a CUDA build...' -ForegroundColor Cyan
-  $CudaBuild = & $PythonExe -c "import torch; print(torch.version.cuda or '')"
-  $TorchCheckExit = $LASTEXITCODE
+function Get-CudaCapabilityCode([string]$PythonExe) {
+  $Result = & $PythonExe -c "import torch; c=torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0,0); print(c[0]*10+c[1])" 2>$null
+  if ($LASTEXITCODE -ne 0) { return 0 }
+  $Text = ($Result | Select-Object -Last 1 | Out-String).Trim()
+  $Value = 0
+  if ([int]::TryParse($Text, [ref]$Value)) { return $Value }
+  return 0
+}
 
-  if (($TorchCheckExit -ne 0) -or [string]::IsNullOrWhiteSpace(($CudaBuild | Out-String).Trim())) {
-    Write-Host 'Current Torch is missing CUDA support. Replacing it with the CUDA 12.8 wheel...' -ForegroundColor Yellow
+function Test-TorchCudaKernel([string]$PythonExe) {
+  & $PythonExe -c "import torch; assert torch.cuda.is_available(), 'CUDA is not available'; x=torch.ones(32, device='cuda'); y=(x*x).sum(); torch.cuda.synchronize(); print('cuda_kernel_test', float(y.item())); print('cuda_arch_list', ' '.join(torch.cuda.get_arch_list())); print('cuda_device', torch.cuda.get_device_name(0)); print('cuda_capability', '.'.join(map(str, torch.cuda.get_device_capability(0))))" |
+    ForEach-Object { Write-Host $_ }
+  return ($LASTEXITCODE -eq 0)
+}
+
+function Ensure-CudaTorch([string]$PythonExe) {
+  Write-Host 'Checking the installed PyTorch CUDA build with a real GPU kernel...' -ForegroundColor Cyan
+  $CapabilityCode = Get-CudaCapabilityCode -PythonExe $PythonExe
+
+  if (Test-TorchCudaKernel -PythonExe $PythonExe) {
+    Write-Host 'Existing PyTorch CUDA build can execute kernels on this GPU.' -ForegroundColor DarkGreen
+    return
+  }
+
+  if (($CapabilityCode -gt 0) -and ($CapabilityCode -lt 75)) {
+    Write-Host "Detected legacy NVIDIA compute capability $CapabilityCode. Modern CUDA wheels no longer cover this GPU." -ForegroundColor Yellow
+    Write-Host 'Installing Maxwell/Pascal/Volta-compatible PyTorch 2.3.1 + CUDA 11.8...' -ForegroundColor Cyan
+    Invoke-Checked {
+      & $PythonExe -m pip install --upgrade --force-reinstall --no-cache-dir 'torch==2.3.1' --index-url https://download.pytorch.org/whl/cu118
+    } 'Legacy-compatible CUDA PyTorch installation'
+    Write-Host 'Pinning Lightning to a Python 3.12 / Torch 2.3 compatible release line...' -ForegroundColor Cyan
+    Invoke-Checked {
+      & $PythonExe -m pip install --upgrade 'lightning>=2.4,<2.5'
+    } 'Legacy-compatible Lightning installation'
+  } else {
+    Write-Host 'Current CUDA build failed its kernel test. Reinstalling the CUDA 12.8 PyTorch wheel...' -ForegroundColor Yellow
     Invoke-Checked {
       & $PythonExe -m pip install --upgrade --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128
     } 'CUDA PyTorch installation'
-  } else {
-    Write-Host "CUDA-enabled Torch already installed (CUDA runtime $($CudaBuild | Out-String).Trim())." -ForegroundColor DarkGreen
   }
 
+  Write-Host 'Verifying the replacement PyTorch build...' -ForegroundColor Cyan
   Invoke-Checked {
-    & $PythonExe -c "import torch,sys; print('torch', torch.__version__); print('torch_cuda_runtime', torch.version.cuda); sys.exit(0 if torch.version.cuda else 2)"
+    & $PythonExe -c "import torch; print('torch', torch.__version__); print('torch_cuda_runtime', torch.version.cuda); print('cuda_available', torch.cuda.is_available()); print('cuda_arch_list', ' '.join(torch.cuda.get_arch_list()) if torch.cuda.is_available() else 'none')"
   } 'CUDA PyTorch build verification'
 
-  & $PythonExe -c "import torch; print('cuda_available', torch.cuda.is_available()); print('cuda_device_count', torch.cuda.device_count()); print('cuda_device', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
-  if ($LASTEXITCODE -ne 0) {
-    Write-Host 'WARNING: Torch CUDA diagnostics failed. Training can still fall back to CPU when Device is set to auto.' -ForegroundColor Yellow
+  if (-not (Test-TorchCudaKernel -PythonExe $PythonExe)) {
+    throw 'PyTorch can see the NVIDIA GPU but cannot execute a CUDA kernel on it. Select Device=cpu, or use a newer NVIDIA GPU for Piper training.'
   }
 }
 
@@ -222,7 +258,7 @@ Write-Host 'Building Piper eSpeak native bridge...' -ForegroundColor Cyan
 Build-PiperEspeakBridge -SourceDir $Source -PythonExe $TrainerPython
 
 if ($Engine -eq 'cuda') {
-  Write-Host 'Selecting CUDA 12.8 PyTorch wheels...' -ForegroundColor Cyan
+  Write-Host 'Selecting a PyTorch CUDA build compatible with the detected GPU...' -ForegroundColor Cyan
   Ensure-CudaTorch -PythonExe $TrainerPython
 } else {
   Write-Host 'Selecting CPU PyTorch wheels...' -ForegroundColor Cyan
@@ -235,10 +271,10 @@ Build-PiperMonotonicAlignment -AlignDir $AlignDir -PythonExe $TrainerPython
 
 Write-Host 'Verifying Piper trainer, eSpeak phonemizer and native extensions...' -ForegroundColor Cyan
 Invoke-Checked {
-  & $TrainerPython -c "import torch; import piper.train; from piper.phonemize_espeak import EspeakPhonemizer; p=EspeakPhonemizer(); assert p.phonemize('en-GB-x-rp','Piper trainer verification.'); from piper.train.vits.monotonic_align.core import maximum_path_c; print('espeak_voice', 'en-GB-x-rp'); print('espeakbridge_ok', True); print('alignment_ok', True); print('torch', torch.__version__); print('torch_cuda_runtime', torch.version.cuda); print('cuda_available', torch.cuda.is_available())"
+  & $TrainerPython -c "import torch; import piper.train; from piper.phonemize_espeak import EspeakPhonemizer; p=EspeakPhonemizer(); assert p.phonemize('en-GB-x-rp','Piper trainer verification.'); from piper.train.vits.monotonic_align.monotonic_align.core import maximum_path_c; from piper.train.vits.monotonic_align import maximum_path; print('espeak_voice', 'en-GB-x-rp'); print('espeakbridge_ok', True); print('alignment_ok', True); print('torch', torch.__version__); print('torch_cuda_runtime', torch.version.cuda); print('cuda_available', torch.cuda.is_available())"
 } 'Piper trainer verification'
 
-Set-Content -LiteralPath $Marker -Encoding UTF8 -Value "piper-trainer-v3; engine=$Engine; completed=$(Get-Date -Format o); source=https://github.com/OHF-Voice/piper1-gpl"
+Set-Content -LiteralPath $Marker -Encoding UTF8 -Value "piper-trainer-v4; engine=$Engine; completed=$(Get-Date -Format o); source=https://github.com/OHF-Voice/piper1-gpl"
 
 Write-Host ''
 Write-Host 'Piper trainer is ready.' -ForegroundColor Green
