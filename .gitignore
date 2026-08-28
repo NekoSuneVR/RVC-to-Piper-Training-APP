@@ -1,0 +1,7 @@
+tools/
+models/
+data/
+generated/
+data/settings.json
+__pycache__/
+*.pyc
