@@ -142,6 +142,30 @@ function Build-PiperMonotonicAlignment([string]$AlignDir, [string]$PythonExe) {
   }
 }
 
+function Ensure-CudaTorch([string]$PythonExe) {
+  Write-Host 'Checking whether PyTorch is a CUDA build...' -ForegroundColor Cyan
+  $CudaBuild = & $PythonExe -c "import torch; print(torch.version.cuda or '')"
+  $TorchCheckExit = $LASTEXITCODE
+
+  if (($TorchCheckExit -ne 0) -or [string]::IsNullOrWhiteSpace(($CudaBuild | Out-String).Trim())) {
+    Write-Host 'Current Torch is missing CUDA support. Replacing it with the CUDA 12.8 wheel...' -ForegroundColor Yellow
+    Invoke-Checked {
+      & $PythonExe -m pip install --upgrade --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128
+    } 'CUDA PyTorch installation'
+  } else {
+    Write-Host "CUDA-enabled Torch already installed (CUDA runtime $($CudaBuild | Out-String).Trim())." -ForegroundColor DarkGreen
+  }
+
+  Invoke-Checked {
+    & $PythonExe -c "import torch,sys; print('torch', torch.__version__); print('torch_cuda_runtime', torch.version.cuda); sys.exit(0 if torch.version.cuda else 2)"
+  } 'CUDA PyTorch build verification'
+
+  & $PythonExe -c "import torch; print('cuda_available', torch.cuda.is_available()); print('cuda_device_count', torch.cuda.device_count()); print('cuda_device', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host 'WARNING: Torch CUDA diagnostics failed. Training can still fall back to CPU when Device is set to auto.' -ForegroundColor Yellow
+  }
+}
+
 New-Item -ItemType Directory -Force -Path $TrainerRoot | Out-Null
 if (Test-Path $Marker) {
   Remove-Item -LiteralPath $Marker -Force -ErrorAction SilentlyContinue
@@ -199,7 +223,7 @@ Build-PiperEspeakBridge -SourceDir $Source -PythonExe $TrainerPython
 
 if ($Engine -eq 'cuda') {
   Write-Host 'Selecting CUDA 12.8 PyTorch wheels...' -ForegroundColor Cyan
-  Invoke-Checked { & $TrainerPython -m pip install --upgrade torch --index-url https://download.pytorch.org/whl/cu128 } 'CUDA PyTorch installation'
+  Ensure-CudaTorch -PythonExe $TrainerPython
 } else {
   Write-Host 'Selecting CPU PyTorch wheels...' -ForegroundColor Cyan
   Invoke-Checked { & $TrainerPython -m pip install --upgrade torch --index-url https://download.pytorch.org/whl/cpu } 'CPU PyTorch installation'
@@ -211,10 +235,10 @@ Build-PiperMonotonicAlignment -AlignDir $AlignDir -PythonExe $TrainerPython
 
 Write-Host 'Verifying Piper trainer, eSpeak phonemizer and native extensions...' -ForegroundColor Cyan
 Invoke-Checked {
-  & $TrainerPython -c "import torch; import piper.train; from piper.phonemize_espeak import EspeakPhonemizer; p=EspeakPhonemizer(); assert p.phonemize('en-gb','Piper trainer verification.'); from piper.train.vits.monotonic_align.core import maximum_path_c; print('espeakbridge_ok', True); print('alignment_ok', True); print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available())"
+  & $TrainerPython -c "import torch; import piper.train; from piper.phonemize_espeak import EspeakPhonemizer; p=EspeakPhonemizer(); assert p.phonemize('en-GB-x-rp','Piper trainer verification.'); from piper.train.vits.monotonic_align.core import maximum_path_c; print('espeak_voice', 'en-GB-x-rp'); print('espeakbridge_ok', True); print('alignment_ok', True); print('torch', torch.__version__); print('torch_cuda_runtime', torch.version.cuda); print('cuda_available', torch.cuda.is_available())"
 } 'Piper trainer verification'
 
-Set-Content -LiteralPath $Marker -Encoding UTF8 -Value "piper-trainer-v2; engine=$Engine; completed=$(Get-Date -Format o); source=https://github.com/OHF-Voice/piper1-gpl"
+Set-Content -LiteralPath $Marker -Encoding UTF8 -Value "piper-trainer-v3; engine=$Engine; completed=$(Get-Date -Format o); source=https://github.com/OHF-Voice/piper1-gpl"
 
 Write-Host ''
 Write-Host 'Piper trainer is ready.' -ForegroundColor Green
