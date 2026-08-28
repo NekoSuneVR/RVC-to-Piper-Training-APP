@@ -1,7 +1,7 @@
 tools/
 models/
-data/
 generated/
+training/
 data/settings.json
 __pycache__/
 *.pyc
