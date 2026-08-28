@@ -9,6 +9,7 @@ from piper_training import (
     export_command,
     latest_checkpoint,
     load_prompts,
+    normalize_espeak_voice,
     safe_voice_name,
     training_command,
     write_metadata,
@@ -20,6 +21,12 @@ class PiperTrainingTests(unittest.TestCase):
         self.assertEqual(safe_voice_name("en GB My Voice medium"), "en-GB-My-Voice-medium")
         with self.assertRaises(ValueError):
             safe_voice_name("!!!")
+
+    def test_espeak_voice_aliases(self):
+        self.assertEqual(normalize_espeak_voice("en-gb"), "en-GB-x-rp")
+        self.assertEqual(normalize_espeak_voice("EN_GB"), "en-GB-x-rp")
+        self.assertEqual(normalize_espeak_voice("en-us"), "en-US")
+        self.assertEqual(normalize_espeak_voice("de"), "de")
 
     def test_prompt_loader_deduplicates_and_limits(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -42,6 +49,8 @@ class PiperTrainingTests(unittest.TestCase):
             self.assertEqual(command[1:4], ["-m", "piper.train", "fit"])
             self.assertIn("--data.csv_path", command)
             self.assertIn("--ckpt_path", command)
+            voice_index = command.index("--data.espeak_voice") + 1
+            self.assertEqual(command[voice_index], "en-GB-x-rp")
             export = export_command(plan, root / "last.ckpt")
             self.assertEqual(export[1:3], ["-m", "piper.train.export_onnx"])
             self.assertIn(str(plan.onnx_path), export)
