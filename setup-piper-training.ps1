@@ -14,6 +14,7 @@ $TrainerPython = Join-Path $Venv 'Scripts\python.exe'
 $Source = Join-Path $TrainerRoot 'piper1-gpl'
 $Zip = Join-Path $TrainerRoot 'piper1-gpl.zip'
 $Extract = Join-Path $TrainerRoot 'source-download'
+$Marker = Join-Path $TrainerRoot '.setup-complete'
 
 function Invoke-Checked([scriptblock]$Command, [string]$Description) {
   & $Command
@@ -39,6 +40,64 @@ function Test-CppBuildTools {
   return [bool]$InstallPath
 }
 
+function Build-PiperEspeakBridge([string]$SourceDir, [string]$PythonExe) {
+  $RealPiper = Join-Path $SourceDir 'src\piper'
+  $ExistingBridge = Get-ChildItem -LiteralPath $RealPiper -Filter 'espeakbridge*.pyd' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+  $RealData = Join-Path $RealPiper 'espeak-ng-data'
+  if ($ExistingBridge -and (Test-Path $RealData)) {
+    Write-Host "Piper eSpeak bridge already present: $($ExistingBridge.Name)" -ForegroundColor DarkGreen
+    return
+  }
+
+  $ShortRoot = Join-Path $env:TEMP ("ppb-" + $PID)
+  $ShortSource = Join-Path $ShortRoot 'piper'
+  if (Test-Path $ShortRoot) {
+    Remove-Item -LiteralPath $ShortRoot -Recurse -Force
+  }
+  New-Item -ItemType Directory -Force -Path $ShortSource | Out-Null
+
+  try {
+    Write-Host "Copying Piper source to short native-build path: $ShortSource" -ForegroundColor DarkCyan
+    Copy-Item -Path (Join-Path $SourceDir '*') -Destination $ShortSource -Recurse -Force
+
+    Push-Location $ShortSource
+    try {
+      Write-Host 'Building Piper eSpeak bridge and embedded eSpeak-ng data...' -ForegroundColor Cyan
+      Invoke-Checked { & $PythonExe setup.py build_ext --inplace } 'Piper eSpeak bridge build'
+    } finally {
+      Pop-Location
+    }
+
+    $BuiltBridge = Get-ChildItem -LiteralPath $ShortSource -Filter 'espeakbridge*.pyd' -File -Recurse |
+      Sort-Object LastWriteTime -Descending |
+      Select-Object -First 1
+    if (-not $BuiltBridge) {
+      throw "Piper native build finished without producing espeakbridge*.pyd under $ShortSource"
+    }
+
+    $ShortData = Join-Path $ShortSource 'src\piper\espeak-ng-data'
+    if (-not (Test-Path $ShortData)) {
+      throw "Piper native build did not create espeak-ng-data at $ShortData"
+    }
+
+    Get-ChildItem -LiteralPath $RealPiper -Filter 'espeakbridge*.pyd' -File -ErrorAction SilentlyContinue |
+      Remove-Item -Force -ErrorAction SilentlyContinue
+    Copy-Item -LiteralPath $BuiltBridge.FullName -Destination (Join-Path $RealPiper $BuiltBridge.Name) -Force
+
+    if (Test-Path $RealData) {
+      Remove-Item -LiteralPath $RealData -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $RealData | Out-Null
+    Copy-Item -Path (Join-Path $ShortData '*') -Destination $RealData -Recurse -Force
+
+    Write-Host "Installed Piper eSpeak bridge: $($BuiltBridge.Name)" -ForegroundColor Green
+  } finally {
+    if (Test-Path $ShortRoot) {
+      Remove-Item -LiteralPath $ShortRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
 function Build-PiperMonotonicAlignment([string]$AlignDir, [string]$PythonExe) {
   # Piper's setup.py passes an absolute path to core.pyx into Cython. On Windows,
   # setuptools mirrors that path below build\temp when creating core.obj. If the
@@ -55,7 +114,7 @@ function Build-PiperMonotonicAlignment([string]$AlignDir, [string]$PythonExe) {
     Copy-Item -LiteralPath (Join-Path $AlignDir 'setup.py') -Destination (Join-Path $ShortBuild 'setup.py') -Force
     Copy-Item -LiteralPath (Join-Path $AlignDir 'core.pyx') -Destination (Join-Path $ShortBuild 'core.pyx') -Force
 
-    Write-Host "Compiling from short path: $ShortBuild" -ForegroundColor DarkCyan
+    Write-Host "Compiling alignment from short path: $ShortBuild" -ForegroundColor DarkCyan
     Push-Location $ShortBuild
     try {
       Invoke-Checked {
@@ -84,6 +143,9 @@ function Build-PiperMonotonicAlignment([string]$AlignDir, [string]$PythonExe) {
 }
 
 New-Item -ItemType Directory -Force -Path $TrainerRoot | Out-Null
+if (Test-Path $Marker) {
+  Remove-Item -LiteralPath $Marker -Force -ErrorAction SilentlyContinue
+}
 
 if (-not (Test-Path $AppPython)) {
   throw "App-local Python was not found at $AppPython. Run Easy Setup.cmd first."
@@ -99,7 +161,7 @@ if (-not (Test-CppBuildTools)) {
     } 'Visual Studio Build Tools installation'
   } else {
     throw @'
-Piper training needs the Microsoft C++ build tools to compile monotonic alignment.
+Piper training needs the Microsoft C++ build tools to compile its native extensions.
 Install "Visual Studio 2022 Build Tools" with the "Desktop development with C++" workload,
 or run this script again with -InstallBuildTools.
 '@
@@ -132,6 +194,9 @@ Invoke-Checked { & $TrainerPython -m pip install --upgrade scikit-build cmake ni
 $EditableSpec = "$Source[train]"
 Invoke-Checked { & $TrainerPython -m pip install -e $EditableSpec } 'Piper training package installation'
 
+Write-Host 'Building Piper eSpeak native bridge...' -ForegroundColor Cyan
+Build-PiperEspeakBridge -SourceDir $Source -PythonExe $TrainerPython
+
 if ($Engine -eq 'cuda') {
   Write-Host 'Selecting CUDA 12.8 PyTorch wheels...' -ForegroundColor Cyan
   Invoke-Checked { & $TrainerPython -m pip install --upgrade torch --index-url https://download.pytorch.org/whl/cu128 } 'CUDA PyTorch installation'
@@ -144,16 +209,16 @@ $AlignDir = Join-Path $Source 'src\piper\train\vits\monotonic_align'
 Write-Host 'Building Piper monotonic alignment extension...' -ForegroundColor Cyan
 Build-PiperMonotonicAlignment -AlignDir $AlignDir -PythonExe $TrainerPython
 
-Write-Host 'Verifying Piper trainer...' -ForegroundColor Cyan
+Write-Host 'Verifying Piper trainer, eSpeak phonemizer and native extensions...' -ForegroundColor Cyan
 Invoke-Checked {
-  & $TrainerPython -c "import torch; import piper.train; from piper.train.vits.monotonic_align.core import maximum_path_c; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available())"
+  & $TrainerPython -c "import torch; import piper.train; from piper.phonemize_espeak import EspeakPhonemizer; p=EspeakPhonemizer(); assert p.phonemize('en-gb','Piper trainer verification.'); from piper.train.vits.monotonic_align.core import maximum_path_c; print('espeakbridge_ok', True); print('alignment_ok', True); print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available())"
 } 'Piper trainer verification'
 
-$Marker = Join-Path $TrainerRoot '.setup-complete'
-Set-Content -LiteralPath $Marker -Encoding UTF8 -Value "piper-trainer; engine=$Engine; completed=$(Get-Date -Format o); source=https://github.com/OHF-Voice/piper1-gpl"
+Set-Content -LiteralPath $Marker -Encoding UTF8 -Value "piper-trainer-v2; engine=$Engine; completed=$(Get-Date -Format o); source=https://github.com/OHF-Voice/piper1-gpl"
 
 Write-Host ''
 Write-Host 'Piper trainer is ready.' -ForegroundColor Green
 Write-Host "Python: $TrainerPython"
 Write-Host "Source: $Source"
-Write-Host 'Open Build Piper Model.cmd and build your RVC dataset before training.'
+Write-Host 'Native eSpeak bridge: ready'
+Write-Host 'Monotonic alignment: ready'
