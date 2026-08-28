@@ -18,8 +18,9 @@ class GuardedPiperBuilder(PiperBuilder):
         plan = self._plan()
         piper_dir = plan.trainer_source / "src" / "piper"
         align_dir = piper_dir / "train" / "vits" / "monotonic_align"
+        nested_align_dir = align_dir / "monotonic_align"
         has_espeak_bridge = any(piper_dir.glob("espeakbridge*.pyd"))
-        has_alignment = any(align_dir.glob("core*.pyd"))
+        has_alignment = any(nested_align_dir.glob("core*.pyd"))
         has_espeak_data = (piper_dir / "espeak-ng-data").is_dir()
         return (
             plan.trainer_python.is_file()
@@ -34,6 +35,7 @@ class GuardedPiperBuilder(PiperBuilder):
         plan = self._plan()
         piper_dir = plan.trainer_source / "src" / "piper"
         align_dir = piper_dir / "train" / "vits" / "monotonic_align"
+        nested_align_dir = align_dir / "monotonic_align"
         missing: list[str] = []
         if not plan.trainer_python.is_file():
             missing.append(f"Piper trainer Python: {plan.trainer_python}")
@@ -43,8 +45,8 @@ class GuardedPiperBuilder(PiperBuilder):
             missing.append(f"Piper eSpeak native bridge: {piper_dir / 'espeakbridge*.pyd'}")
         if not (piper_dir / "espeak-ng-data").is_dir():
             missing.append(f"Piper eSpeak data: {piper_dir / 'espeak-ng-data'}")
-        if not any(align_dir.glob("core*.pyd")):
-            missing.append(f"Piper monotonic alignment extension: {align_dir / 'core*.pyd'}")
+        if not any(nested_align_dir.glob("core*.pyd")):
+            missing.append(f"Piper nested monotonic alignment extension: {nested_align_dir / 'core*.pyd'}")
         if not TRAINER_MARKER.is_file():
             missing.append(f"Successful trainer setup marker: {TRAINER_MARKER}")
         return missing
