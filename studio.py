@@ -58,7 +58,8 @@ class Studio(BaseStudio):
 
         steps = ttk.Frame(builder, style="Card.TFrame")
         steps.pack(fill="x", pady=(14, 0))
-        steps.columnconfigure((0, 1, 2), weight=1, uniform="builder-step")
+        for column in range(3):
+            steps.columnconfigure(column, weight=1, uniform="builder-step")
         self._builder_step_card(
             steps,
             0,
@@ -190,7 +191,6 @@ class Studio(BaseStudio):
             return
 
         if action in {"dataset", "train", "export", "all"}:
-            # Save the currently visible Studio settings before the builder reads settings.json.
             try:
                 self._collect().save()
             except (ValueError, tk.TclError) as exc:
