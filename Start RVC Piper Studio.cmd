@@ -15,9 +15,9 @@ if errorlevel 1 (
   )
 )
 if exist "tools\python\python.exe" (
-  "tools\python\python.exe" app.py
+  "tools\python\python.exe" studio.py
 ) else (
-  py -3.12 app.py 2>nul || python app.py
+  py -3.12 studio.py 2>nul || python studio.py
 )
 if errorlevel 1 (
   echo.
