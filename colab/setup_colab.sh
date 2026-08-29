@@ -9,10 +9,11 @@ RVC_VENV="${RUNTIME_ROOT}/rvc-venv"
 PIPER_VENV="${RUNTIME_ROOT}/piper-venv"
 BASE_DIR="${RUNTIME_ROOT}/base-voice"
 LOG_FILE="${RUNTIME_ROOT}/setup.log"
+MODE_FILE="${RUNTIME_ROOT}/compute.mode"
 TARGET_PYTHON="3.12"
 TORCH_VERSION="2.7.1"
 TORCH_CUDA="${RVC_PIPER_TORCH_CUDA:-cu126}"
-TORCH_INDEX="https://download.pytorch.org/whl/${TORCH_CUDA}"
+REQUESTED_COMPUTE="${RVC_PIPER_COMPUTE:-auto}"
 
 mkdir -p "${RUNTIME_ROOT}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -31,29 +32,71 @@ setup_failed() {
 }
 trap setup_failed EXIT
 
+case "${REQUESTED_COMPUTE}" in
+  auto|gpu|cpu) ;;
+  *)
+    echo "ERROR: RVC_PIPER_COMPUTE must be auto, gpu, or cpu (got: ${REQUESTED_COMPUTE})." >&2
+    exit 2
+    ;;
+esac
+
+HAS_NVIDIA=0
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+  HAS_NVIDIA=1
+fi
+
+if [ "${REQUESTED_COMPUTE}" = "auto" ]; then
+  if [ "${HAS_NVIDIA}" = "1" ]; then
+    COMPUTE="gpu"
+  else
+    COMPUTE="cpu"
+  fi
+else
+  COMPUTE="${REQUESTED_COMPUTE}"
+fi
+
+if [ "${COMPUTE}" = "gpu" ] && [ "${HAS_NVIDIA}" != "1" ]; then
+  echo "ERROR: GPU mode was selected but no NVIDIA GPU is attached to this Colab runtime." >&2
+  echo "Choose Runtime > Change runtime type > GPU, or select CPU/Auto in the notebook." >&2
+  exit 2
+fi
+
+if [ "${COMPUTE}" = "gpu" ]; then
+  TORCH_FLAVOR="${TORCH_CUDA}"
+  TORCH_INDEX="https://download.pytorch.org/whl/${TORCH_CUDA}"
+  TORCH_SPEC="${TORCH_VERSION}+${TORCH_CUDA}"
+else
+  TORCH_FLAVOR="cpu"
+  TORCH_INDEX="https://download.pytorch.org/whl/cpu"
+  TORCH_SPEC="${TORCH_VERSION}+cpu"
+fi
+
 echo "=== RVC + Piper Studio: Google Colab setup ==="
 echo "App:              ${APP_ROOT}"
 echo "Runtime:          ${RUNTIME_ROOT}"
 echo "Colab Python:     $(python3 --version 2>&1)"
 echo "Managed Python:   ${TARGET_PYTHON}"
-echo "PyTorch CUDA:     ${TORCH_CUDA}"
+echo "Requested mode:   ${REQUESTED_COMPUTE}"
+echo "Resolved mode:    ${COMPUTE}"
+echo "PyTorch wheel:    ${TORCH_SPEC}"
 echo
 
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "ERROR: No NVIDIA GPU runtime detected. In Colab choose Runtime > Change runtime type > GPU." >&2
-  exit 2
+if [ "${COMPUTE}" = "gpu" ]; then
+  nvidia-smi || true
+else
+  echo "CPU mode selected; NVIDIA GPU is not required."
 fi
 
-nvidia-smi || true
 python3 - <<'PY'
-import torch
-print("Colab base torch:", torch.__version__)
-print("Colab base CUDA:", torch.version.cuda)
-print("CUDA available:", torch.cuda.is_available())
-if not torch.cuda.is_available():
-    raise SystemExit("PyTorch cannot access the Colab GPU.")
-print("GPU:", torch.cuda.get_device_name(0))
-print("Capability:", torch.cuda.get_device_capability(0))
+try:
+    import torch
+    print("Colab base torch:", torch.__version__)
+    print("Colab base CUDA:", torch.version.cuda)
+    print("Colab base CUDA available:", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("Colab base GPU:", torch.cuda.get_device_name(0))
+except Exception as exc:
+    print("Colab base torch probe unavailable:", exc)
 PY
 
 export DEBIAN_FRONTEND=noninteractive
@@ -61,9 +104,8 @@ apt-get -qq update
 apt-get -qq install -y \
   git build-essential cmake ninja-build ffmpeg libsndfile1 pkg-config >/dev/null
 
-# Colab currently moves its system Python independently of RVC/Piper. RVC's
-# stable NumPy/SciPy stack is Python 3.12-oriented, so use uv-managed Python
-# 3.12 instead of inheriting Colab's Python 3.13+ site-packages.
+# Colab's system Python changes independently of RVC/Piper. Keep a managed
+# Python 3.12 runtime so the pinned NumPy/SciPy/RVC stack stays reproducible.
 echo
 echo "=== Preparing managed Python ${TARGET_PYTHON} ==="
 python3 -m pip install -q --upgrade uv
@@ -74,6 +116,16 @@ if [ -z "${UV_BIN}" ]; then
 fi
 export UV_PYTHON_INSTALL_DIR="${RUNTIME_ROOT}/uv-python"
 "${UV_BIN}" python install "${TARGET_PYTHON}"
+
+# Switching CPU <-> GPU in the same Colab VM must not reuse an environment
+# containing the other PyTorch wheel.
+if [ -f "${MODE_FILE}" ]; then
+  PREVIOUS_MODE="$(cat "${MODE_FILE}" 2>/dev/null || true)"
+  if [ -n "${PREVIOUS_MODE}" ] && [ "${PREVIOUS_MODE}" != "${COMPUTE}" ]; then
+    echo "Compute mode changed ${PREVIOUS_MODE} -> ${COMPUTE}; rebuilding RVC/Piper virtual environments."
+    rm -rf "${RVC_VENV}" "${PIPER_VENV}"
+  fi
+fi
 
 ensure_py312_venv() {
   local venv="$1"
@@ -113,15 +165,17 @@ else
   git -C "${PIPER_ROOT}" pull --ff-only
 fi
 
-install_cuda_torch() {
+install_torch() {
   local python="$1"
   local label="$2"
-  echo "Installing ${label} PyTorch ${TORCH_VERSION} (${TORCH_CUDA})..."
+  echo "Installing ${label} PyTorch ${TORCH_SPEC} (${COMPUTE})..."
   "${python}" -m pip install -q --upgrade pip wheel
   "${python}" -m pip install -q --upgrade --index-url "${TORCH_INDEX}" \
-    "torch==${TORCH_VERSION}+${TORCH_CUDA}" \
-    "torchaudio==${TORCH_VERSION}+${TORCH_CUDA}"
-  "${python}" -W ignore - <<PY
+    "torch==${TORCH_SPEC}" \
+    "torchaudio==${TORCH_SPEC}"
+
+  if [ "${COMPUTE}" = "gpu" ]; then
+    "${python}" -W ignore - <<PY
 import torch
 print("${label} torch:", torch.__version__)
 print("${label} CUDA runtime:", torch.version.cuda)
@@ -132,12 +186,21 @@ x = torch.arange(8, device="cuda", dtype=torch.float32).sum()
 print("${label} CUDA kernel test:", float(x.item()))
 print("${label} GPU:", torch.cuda.get_device_name(0))
 PY
+  else
+    "${python}" -W ignore - <<PY
+import torch
+print("${label} torch:", torch.__version__)
+print("${label} CUDA available:", torch.cuda.is_available())
+x = torch.arange(8, dtype=torch.float32).sum()
+print("${label} CPU kernel test:", float(x.item()))
+PY
+  fi
 }
 
 echo
 echo "=== Installing RVC inference environment ==="
 "${RVC_PY}" -m pip install -q --upgrade 'setuptools<81' wheel
-install_cuda_torch "${RVC_PY}" "RVC"
+install_torch "${RVC_PY}" "RVC"
 
 # Headless dependencies only. Avoid the old Gradio/UI dependency tree because
 # Colab only needs infer.cli for dataset generation.
@@ -175,7 +238,7 @@ fi
 echo
 echo "=== Installing Piper training/inference environment ==="
 "${PIPER_PY}" -m pip install -q --upgrade 'setuptools<82' wheel scikit-build 'cmake>=3.26,<4' ninja 'cython>=3,<4'
-install_cuda_torch "${PIPER_PY}" "Piper"
+install_torch "${PIPER_PY}" "Piper"
 "${PIPER_PY}" -m pip install -q \
   'numpy==1.26.4' 'scipy==1.13.1' 'ml-dtypes>=0.5,<0.6' 'onnx>=1.17,<2'
 "${PIPER_PY}" -m pip install -q -e "${PIPER_ROOT}[train]"
@@ -197,7 +260,7 @@ ALIGN_DIR="${PIPER_ROOT}/src/piper/train/vits/monotonic_align"
 )
 
 echo
-echo "=== Downloading base Piper voice ==="
+echo "=== Downloading default base Piper voice ==="
 "${PIPER_PY}" - <<PY
 from pathlib import Path
 import urllib.request
@@ -225,6 +288,7 @@ print("RVC torch:   ", torch.__version__)
 print("RVC NumPy:   ", numpy.__version__)
 print("RVC SciPy:   ", scipy.__version__)
 print("RVC CUDA:    ", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
+print("RVC compute: ", "gpu" if torch.cuda.is_available() else "cpu")
 print("RVC imports: OK")
 PY
 
@@ -241,9 +305,12 @@ print("Piper torch: ", torch.__version__)
 print("Piper NumPy: ", numpy.__version__)
 print("Piper SciPy: ", scipy.__version__)
 print("Piper CUDA:  ", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
+print("Piper compute:", "gpu" if torch.cuda.is_available() else "cpu")
 print("eSpeak bridge: OK")
 print("monotonic alignment: OK")
 PY
+
+printf '%s\n' "${COMPUTE}" > "${MODE_FILE}"
 
 cat > "${RUNTIME_ROOT}/paths.env" <<EOF
 APP_ROOT=${APP_ROOT}
@@ -252,12 +319,15 @@ RVC_ROOT=${RVC_ROOT}
 RVC_PY=${RVC_PY}
 PIPER_ROOT=${PIPER_ROOT}
 PIPER_PY=${PIPER_PY}
+COMPUTE=${COMPUTE}
+TORCH_FLAVOR=${TORCH_FLAVOR}
 BASE_MODEL=${BASE_DIR}/en_GB-alba-medium.onnx
 BASE_CONFIG=${BASE_DIR}/en_GB-alba-medium.onnx.json
 EOF
 
 echo
 echo "Colab runtime is ready."
+echo "Compute mode: ${COMPUTE}"
 echo "RVC Python:   ${RVC_PY}"
 echo "Piper Python: ${PIPER_PY}"
 echo "Base voice:   ${BASE_DIR}/en_GB-alba-medium.onnx"
