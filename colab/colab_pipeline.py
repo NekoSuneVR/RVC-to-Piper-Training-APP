@@ -72,7 +72,7 @@ def download(url: str, destination: Path, minimum_size: int = 1) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     part = destination.with_suffix(destination.suffix + ".part")
     part.unlink(missing_ok=True)
-    request = urllib.request.Request(url, headers={"User-Agent": "RVC-Piper-Colab/1.0"})
+    request = urllib.request.Request(url, headers={"User-Agent": "RVC-Piper-Headless/1.0"})
     log(f"Downloading {destination.name} ...")
     try:
         with urllib.request.urlopen(request, timeout=120) as response, part.open("wb") as handle:
@@ -150,7 +150,7 @@ def synthesize_base(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Google Colab RVC -> Piper headless builder")
+    parser = argparse.ArgumentParser(description="Headless RVC -> Piper builder")
     subparsers = parser.add_subparsers(dest="subcommand")
 
     synth = subparsers.add_parser("synthesize-base", help=argparse.SUPPRESS)
@@ -181,6 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmstart-url", default=DEFAULT_WARMSTART_URL)
     parser.add_argument("--checkpoint-every", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--accelerator", choices=["auto", "gpu", "cpu"], default="gpu")
     parser.add_argument("--skip-dataset", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
     return parser
@@ -210,14 +211,8 @@ def main() -> int:
 
     repo_root = Path(args.repo_root).resolve()
     rvc_root = Path(args.rvc_root).resolve()
-
-    # uv virtual environments expose bin/python as a symlink to the managed
-    # base interpreter. Do not Path.resolve() these two paths: following that
-    # symlink loses the venv site-packages and causes imports such as piper/RVC
-    # to disappear in child processes.
     rvc_python = Path(os.path.abspath(os.path.expanduser(args.rvc_python)))
     piper_python = Path(os.path.abspath(os.path.expanduser(args.piper_python)))
-
     drive_root = Path(args.drive_root).resolve()
     rvc_model = Path(args.rvc_model).resolve()
     rvc_index = Path(args.rvc_index).resolve() if args.rvc_index else None
@@ -251,7 +246,8 @@ def main() -> int:
     metadata_csv = dataset_dir / "metadata.csv"
     piper_out = project / "piper"
     training_root = piper_out / "training"
-    local_root = Path("/content/rvc-piper-colab") / args.voice_name
+    local_parent = Path(os.environ.get("RVC_PIPER_WORK_ROOT", "/content/rvc-piper-colab"))
+    local_root = local_parent / args.voice_name
     base_dir = local_root / "base"
     cache_dir = local_root / "cache"
     jobs_json = local_root / "jobs.json"
@@ -307,12 +303,12 @@ def main() -> int:
             run(rvc_cmd, cwd=rvc_root)
             log(f"RVC dataset generation complete: {len(missing_jobs)} new WAV(s).")
         else:
-            log(f"Dataset already complete: {len(prompts)} WAV(s) reused from Google Drive.")
+            log(f"Dataset already complete: {len(prompts)} WAV(s) reused from persistent storage.")
         write_metadata(metadata_csv, rows)
     else:
         if not metadata_csv.is_file() or not audio_dir.is_dir():
-            raise RuntimeError("--skip-dataset was selected, but the Drive dataset is missing.")
-        log("Using existing Google Drive dataset without RVC generation.")
+            raise RuntimeError("--skip-dataset was selected, but the persistent dataset is missing.")
+        log("Using existing persistent dataset without RVC generation.")
 
     env = os.environ.copy()
     env["RVC_PIPER_PITCH"] = str(args.pitch)
@@ -323,7 +319,7 @@ def main() -> int:
     shared_ckpt = drive_root / "_checkpoints" / "en_US-lessac-medium.ckpt"
     resume_ckpt = None if args.no_resume else newest_last_checkpoint(training_root)
     if resume_ckpt:
-        log(f"Resuming Colab training from: {resume_ckpt}")
+        log(f"Resuming training from: {resume_ckpt}")
     else:
         download(args.warmstart_url, shared_ckpt, minimum_size=100_000_000)
         log(f"Starting a fresh fine-tune from warm-start: {shared_ckpt}")
@@ -342,7 +338,7 @@ def main() -> int:
         "--data.batch_size", str(args.batch_size),
         "--data.num_workers", str(args.num_workers),
         "--trainer.max_epochs", str(args.max_epochs),
-        "--trainer.accelerator", "gpu",
+        "--trainer.accelerator", args.accelerator,
         "--trainer.devices", "1",
         "--trainer.default_root_dir", str(training_root),
         "--model.mos_metric", "none",
@@ -353,7 +349,7 @@ def main() -> int:
         train_cmd += ["--model.warmstart_ckpt", str(shared_ckpt)]
 
     log("")
-    log("=== Piper training on Colab GPU ===")
+    log(f"=== Piper training on {args.accelerator.upper()} ===")
     run(train_cmd, cwd=repo_root, env=env)
 
     checkpoint = best_checkpoint_newest_run(training_root)
@@ -383,7 +379,7 @@ def main() -> int:
     log("=== DONE ===")
     log(f"ONNX:   {onnx_path}")
     log(f"Config: {config_path}")
-    log(f"Drive project: {project}")
+    log(f"Project: {project}")
     return 0
 
 
