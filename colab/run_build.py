@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,39 @@ def value_after(args: list[str], name: str, default: str = "") -> str:
     if index + 1 >= len(args):
         return default
     return args[index + 1]
+
+
+def replace_value(args: list[str], name: str, value: str) -> None:
+    try:
+        index = args.index(name)
+    except ValueError:
+        return
+    if index + 1 < len(args):
+        args[index + 1] = value
+
+
+def make_python_launcher(name: str, target: str) -> Path:
+    """Create a real executable file that forwards to a venv Python symlink.
+
+    uv virtual environments commonly expose ``bin/python`` as a symlink to the
+    managed base interpreter. Calling ``Path.resolve()`` on that symlink loses
+    the venv context and therefore its site-packages. The Colab pipeline has
+    historically resolved interpreter paths, so use a real shell launcher as
+    the path that gets resolved. The launcher then invokes the original venv
+    path, preserving pyvenv.cfg/site-packages correctly.
+    """
+
+    launcher_dir = RUNTIME_ROOT / "launchers"
+    launcher_dir.mkdir(parents=True, exist_ok=True)
+    launcher = launcher_dir / name
+    launcher.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -e\n"
+        f"exec {shlex.quote(target)} \"$@\"\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    return launcher
 
 
 def stream(command: list[str], env: dict[str, str]) -> int:
@@ -52,14 +86,14 @@ def print_log_tail(lines: int = 160) -> None:
 
 
 def main() -> int:
-    pipeline_args = sys.argv[1:]
+    pipeline_args = list(sys.argv[1:])
     if not pipeline_args:
         raise SystemExit("Pass the normal colab_pipeline.py arguments to this runner.")
 
     repo_root = value_after(pipeline_args, "--repo-root")
     rvc_root = value_after(pipeline_args, "--rvc-root")
-    rvc_python = value_after(pipeline_args, "--rvc-python")
-    piper_python = value_after(pipeline_args, "--piper-python")
+    rvc_python_original = value_after(pipeline_args, "--rvc-python")
+    piper_python_original = value_after(pipeline_args, "--piper-python")
     base_model = value_after(pipeline_args, "--base-model")
     base_config = value_after(pipeline_args, "--base-config")
     rvc_model = value_after(pipeline_args, "--rvc-model")
@@ -72,8 +106,8 @@ def main() -> int:
     required = {
         "--repo-root": repo_root,
         "--rvc-root": rvc_root,
-        "--rvc-python": rvc_python,
-        "--piper-python": piper_python,
+        "--rvc-python": rvc_python_original,
+        "--piper-python": piper_python_original,
         "--base-model": base_model,
         "--base-config": base_config,
         "--rvc-model": rvc_model,
@@ -81,6 +115,22 @@ def main() -> int:
     missing = [name for name, value in required.items() if not value]
     if missing:
         raise SystemExit("Missing required build arguments: " + ", ".join(missing))
+
+    for python_path, label in (
+        (rvc_python_original, "RVC venv Python"),
+        (piper_python_original, "Piper venv Python"),
+    ):
+        if not Path(python_path).exists():
+            raise SystemExit(f"{label} not found: {python_path}")
+
+    # Do not let Path.resolve() inside the existing pipeline follow uv's
+    # bin/python symlink back to the bare managed interpreter. These launchers
+    # are normal files, so resolving them is safe while they still exec the
+    # original venv interpreter path.
+    rvc_python = str(make_python_launcher("rvc-python", rvc_python_original))
+    piper_python = str(make_python_launcher("piper-python", piper_python_original))
+    replace_value(pipeline_args, "--rvc-python", rvc_python)
+    replace_value(pipeline_args, "--piper-python", piper_python)
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -94,6 +144,9 @@ def main() -> int:
     LOG_PATH.unlink(missing_ok=True)
     print("=== RVC + Piper Colab guarded build ===", flush=True)
     print("Legacy RVC checkpoint compatibility: enabled for trusted local .pth files", flush=True)
+    print("uv venv launcher compatibility: enabled", flush=True)
+    print(f"RVC venv:   {rvc_python_original}", flush=True)
+    print(f"Piper venv: {piper_python_original}", flush=True)
     print(f"Build log: {LOG_PATH}", flush=True)
 
     preflight = [
