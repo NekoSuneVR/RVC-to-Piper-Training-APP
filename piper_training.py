@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 TRAIN_WRAPPER = Path(__file__).resolve().with_name("piper_train_wrapper.py")
+VAL_MEL_RE = re.compile(r"val_mel=([0-9]+(?:\.[0-9]+)?)")
 
 ESPEAK_VOICE_ALIASES = {
     "en-gb": "en-GB-x-rp",
@@ -135,7 +136,10 @@ def training_command(plan: PiperTrainPlan) -> list[str]:
         "--trainer.default_root_dir", str(plan.lightning_dir),
     ]
     if plan.checkpoint:
-        command += ["--ckpt_path", str(plan.checkpoint)]
+        # This is a true warm-start: copy compatible model weights but start a
+        # fresh optimizer/epoch schedule. Do not use Lightning --ckpt_path here,
+        # because that resumes the old checkpoint's training state.
+        command += ["--model.warmstart_ckpt", str(plan.checkpoint)]
     return command
 
 
@@ -149,9 +153,21 @@ def export_command(plan: PiperTrainPlan, checkpoint: Path) -> list[str]:
 
 
 def latest_checkpoint(root: Path) -> Path | None:
+    """Choose Piper's best val_mel checkpoint, with latest-file fallback."""
     candidates = [p for p in root.rglob("*.ckpt") if p.is_file()]
     if not candidates:
         return None
+
+    scored: list[tuple[float, int, Path]] = []
+    for path in candidates:
+        match = VAL_MEL_RE.search(path.name)
+        if match:
+            scored.append((float(match.group(1)), -path.stat().st_mtime_ns, path))
+
+    if scored:
+        # Lower mel L1 is better. For an exact score tie, prefer the newest.
+        return min(scored, key=lambda item: (item[0], item[1]))[2]
+
     return max(candidates, key=lambda p: p.stat().st_mtime_ns)
 
 
