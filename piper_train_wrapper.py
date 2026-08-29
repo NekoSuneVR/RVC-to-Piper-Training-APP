@@ -20,7 +20,9 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Older official Piper checkpoints may contain pathlib.PosixPath metadata.
@@ -72,8 +74,6 @@ def _has_any_arg(*names: str) -> bool:
 
 
 def _studio_pitch() -> int:
-    # Colab/headless callers can explicitly provide the pitch without needing a
-    # Windows Studio settings file.
     env_pitch = os.environ.get("RVC_PIPER_PITCH")
     if env_pitch not in (None, ""):
         try:
@@ -185,8 +185,6 @@ def _clean_high_pitch_dataset(pitch: int) -> None:
         try:
             result = run_filter(CLEAN_FILTER)
             if result.returncode != 0:
-                # Some minimal FFmpeg builds omit afftdn. Keep the important
-                # anti-alias/high-frequency cleanup instead of failing setup.
                 result = run_filter(FALLBACK_CLEAN_FILTER)
 
             if result.returncode != 0 or not temp_path.is_file() or temp_path.stat().st_size == 0:
@@ -301,8 +299,6 @@ def _prepare_training() -> None:
     if len(sys.argv) < 2 or sys.argv[1] != "fit":
         return
 
-    # The MOS checkpoint callback is removed below, so avoid loading/downloading
-    # the optional UTMOS predictor as well.
     if not _has_any_arg("--model.mos_metric"):
         sys.argv.extend(["--model.mos_metric", "none"])
 
@@ -314,36 +310,210 @@ def _prepare_training() -> None:
     _enable_high_pitch_warmstart(pitch)
 
 
+def _metric_text(trainer, name: str) -> str | None:
+    value = trainer.callback_metrics.get(name)
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().item()
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError, RuntimeError):
+        return str(value)
+
+
+class _ConsoleProgressCallback:
+    """Created dynamically as a Lightning Callback-compatible object."""
+
+    def __init__(self, callback_base, progress_file: Path, batch_every: int) -> None:
+        self.__class__ = type(
+            "PiperColabConsoleProgress",
+            (callback_base, self.__class__),
+            {},
+        )
+        self.progress_file = progress_file
+        self.batch_every = max(1, batch_every)
+        self.fit_started = time.monotonic()
+        self.epoch_started = self.fit_started
+
+    def _write_progress(self, trainer, status: str) -> None:
+        try:
+            self.progress_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "status": status,
+                "epoch": int(trainer.current_epoch),
+                "epoch_display": int(trainer.current_epoch) + 1,
+                "max_epochs": int(trainer.max_epochs),
+                "global_step": int(trainer.global_step),
+                "device": str(getattr(trainer.strategy, "root_device", "unknown")),
+                "updated_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            for metric in ("train_mel", "loss_g", "loss_d", "val_mel", "val_loss"):
+                text = _metric_text(trainer, metric)
+                if text is not None:
+                    payload[metric] = text
+            temp = self.progress_file.with_suffix(".json.tmp")
+            temp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            temp.replace(self.progress_file)
+        except Exception as exc:
+            print(f"[progress] Could not update {self.progress_file}: {exc}", flush=True)
+
+    def on_fit_start(self, trainer, pl_module) -> None:
+        self.fit_started = time.monotonic()
+        self.epoch_started = self.fit_started
+        device = getattr(trainer.strategy, "root_device", pl_module.device)
+        print("", flush=True)
+        print("================ PIPER TRAINING PROGRESS ================", flush=True)
+        print(f"Device:       {device}", flush=True)
+        print(f"Start epoch:  {int(trainer.current_epoch) + 1}/{trainer.max_epochs}", flush=True)
+        print(f"Global step:  {trainer.global_step}", flush=True)
+        print(f"Progress JSON:{self.progress_file}", flush=True)
+        if int(trainer.current_epoch) > 0 or int(trainer.global_step) > 0:
+            print("RESUME CONFIRMED: checkpoint state, optimizer and step counter were restored.", flush=True)
+        else:
+            print("Fresh training run: no previous training step was restored.", flush=True)
+        print("=========================================================", flush=True)
+        self._write_progress(trainer, "fit_started")
+
+    def on_train_epoch_start(self, trainer, pl_module) -> None:
+        self.epoch_started = time.monotonic()
+        print(
+            f"\n[EPOCH {int(trainer.current_epoch) + 1}/{trainer.max_epochs}] START "
+            f"global_step={trainer.global_step} device={getattr(trainer.strategy, 'root_device', pl_module.device)}",
+            flush=True,
+        )
+        self._write_progress(trainer, "training")
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        try:
+            total = int(trainer.num_training_batches)
+        except (TypeError, ValueError, OverflowError):
+            total = 0
+        batch_no = int(batch_idx) + 1
+        if batch_no != 1 and (batch_no % self.batch_every) != 0 and (not total or batch_no != total):
+            return
+
+        fields = [
+            f"[train] epoch={int(trainer.current_epoch) + 1}/{trainer.max_epochs}",
+            f"batch={batch_no}/{total if total else '?'}",
+            f"step={trainer.global_step}",
+        ]
+        for metric in ("train_mel", "loss_g", "loss_d"):
+            value = _metric_text(trainer, metric)
+            if value is not None:
+                fields.append(f"{metric}={value}")
+        fields.append(f"epoch_time={time.monotonic() - self.epoch_started:.1f}s")
+        print(" ".join(fields), flush=True)
+
+    def on_validation_epoch_end(self, trainer, pl_module) -> None:
+        if getattr(trainer, "sanity_checking", False):
+            print("[validation] sanity check complete", flush=True)
+            return
+        fields = [
+            f"[validation] epoch={int(trainer.current_epoch) + 1}/{trainer.max_epochs}",
+            f"step={trainer.global_step}",
+        ]
+        for metric in ("val_mel", "val_loss", "val_kl", "val_dur"):
+            value = _metric_text(trainer, metric)
+            if value is not None:
+                fields.append(f"{metric}={value}")
+        print(" ".join(fields), flush=True)
+        self._write_progress(trainer, "validated")
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        elapsed = time.monotonic() - self.epoch_started
+        total = time.monotonic() - self.fit_started
+        print(
+            f"[EPOCH {int(trainer.current_epoch) + 1}/{trainer.max_epochs}] COMPLETE "
+            f"global_step={trainer.global_step} epoch_time={elapsed:.1f}s total_time={total / 60:.1f}m",
+            flush=True,
+        )
+        print("[resume] A fresh last.ckpt is scheduled for this epoch.", flush=True)
+        self._write_progress(trainer, "epoch_complete")
+
+    def on_fit_end(self, trainer, pl_module) -> None:
+        print(
+            f"[training] FIT COMPLETE at epoch={int(trainer.current_epoch) + 1} "
+            f"global_step={trainer.global_step} elapsed={(time.monotonic() - self.fit_started) / 60:.1f}m",
+            flush=True,
+        )
+        self._write_progress(trainer, "fit_complete")
+
+
+
 def _configure_callbacks() -> None:
     callbacks = list(getattr(piper_train_main, "_DEFAULT_CALLBACKS", []))
 
     if os.environ.get("PIPER_COLAB", "").strip().lower() in {"1", "true", "yes", "on"}:
-        # Google Drive is far slower than a local SSD, and Piper checkpoints are
-        # large. Save fewer checkpoints, less often, while keeping a resumable
-        # last.ckpt plus the best validation checkpoints.
-        from lightning.pytorch.callbacks import ModelCheckpoint
+        from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 
         try:
-            every_n_epochs = max(1, int(os.environ.get("PIPER_COLAB_CHECKPOINT_EVERY", "5")))
+            best_every = max(1, int(os.environ.get("PIPER_COLAB_CHECKPOINT_EVERY", "5")))
         except ValueError:
-            every_n_epochs = 5
+            best_every = 5
+        try:
+            batch_every = max(1, int(os.environ.get("PIPER_CONSOLE_BATCH_EVERY", "2")))
+        except ValueError:
+            batch_every = 2
+
+        root_raw = _arg_value("--trainer.default_root_dir")
+        training_root = Path(root_raw) if root_raw else Path.cwd() / "training"
+        checkpoint_dir = training_root / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        progress_file = checkpoint_dir / "training-progress.json"
+
+        class VerboseModelCheckpoint(ModelCheckpoint):
+            def _save_checkpoint(self, trainer, filepath: str) -> None:
+                super()._save_checkpoint(trainer, filepath)
+                path = Path(filepath)
+                try:
+                    size = f"{path.stat().st_size / 1024**2:.1f} MB"
+                except OSError:
+                    size = "size unknown"
+                print(
+                    f"[checkpoint] SAVED {path.name} ({size}) "
+                    f"epoch={int(trainer.current_epoch) + 1} step={trainer.global_step}",
+                    flush=True,
+                )
+
+        # Resume safety is independent from best-model cadence. last.ckpt is
+        # refreshed every epoch so a GPU quota/session cut loses at most the
+        # unfinished epoch. Full optimizer/global-step state is preserved, so
+        # the same checkpoint can be resumed on CPU or GPU.
+        resume_checkpoint = VerboseModelCheckpoint(
+            dirpath=str(checkpoint_dir),
+            save_top_k=0,
+            save_last=True,
+            every_n_epochs=1,
+            save_on_train_epoch_end=False,
+        )
+        best_checkpoint = VerboseModelCheckpoint(
+            dirpath=str(checkpoint_dir),
+            monitor="val_mel",
+            mode="min",
+            save_top_k=2,
+            save_last=False,
+            every_n_epochs=best_every,
+            filename="epoch={epoch}-val_mel={val_mel:.4f}",
+            auto_insert_metric_name=False,
+        )
+        progress = _ConsoleProgressCallback(Callback, progress_file, batch_every)
 
         piper_train_main._DEFAULT_CALLBACKS = [
-            ModelCheckpoint(
-                monitor="val_mel",
-                mode="min",
-                save_top_k=2,
-                save_last=True,
-                every_n_epochs=every_n_epochs,
-                filename="epoch={epoch}-val_mel={val_mel:.4f}",
-                auto_insert_metric_name=False,
-            )
+            progress,
+            resume_checkpoint,
+            best_checkpoint,
         ]
         print(
-            "Piper Colab checkpoint mode: best 2 val_mel + last.ckpt, "
-            f"saving every {every_n_epochs} epoch(s).",
+            "Piper Colab checkpoint mode: last.ckpt EVERY epoch for CPU/GPU resume; "
+            f"best 2 val_mel every {best_every} epoch(s).",
             flush=True,
         )
+        print(
+            f"Piper Colab console progress: every {batch_every} training batch(es).",
+            flush=True,
+        )
+        print(f"Persistent checkpoint directory: {checkpoint_dir}", flush=True)
         return
 
     piper_train_main._DEFAULT_CALLBACKS = [
