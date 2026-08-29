@@ -1,0 +1,14 @@
+services:
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    image: rvc-piper-trainer:cpu
+    shm_size: "8gb"
+    env_file:
+      - docker.env
+    environment:
+      COMPUTE: cpu
+    volumes:
+      - ./docker-data:/data
+    restart: "no"
