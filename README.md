@@ -1,6 +1,6 @@
 # RVC + Piper Studio
 
-A local Windows app that turns text into speech with Piper, applies an RVC voice model, and can now build a native Piper voice from the RVC result. A headless Google Colab notebook is also included for cloud-GPU model building.
+A local Windows app that turns text into speech with Piper, applies an RVC voice model, and can now build a native Piper voice from the RVC result. Headless Google Colab and persistent NVIDIA Docker training workflows are also included.
 
 New user? Start with **FIRST-VOICE-GUIDE.md** for the exact files to obtain and a pitch-tuning walkthrough.
 
@@ -22,6 +22,30 @@ For NVIDIA RVC inference setup, open PowerShell in this folder and run:
 ```
 
 Generated WAV files are saved under `generated`. Audio, text, and models never leave the PC unless you deliberately use the Colab workflow described below.
+
+## Persistent NVIDIA Docker GPU build
+
+If Google Drive space is too limited, use the Docker trainer instead. The Docker image contains CUDA, PyTorch, RVC, RMVPE/HuBERT, Piper and the training pipeline, while all large/persistent data is bind-mounted from the host under `docker-data/`.
+
+```bash
+cp docker.env.example docker.env
+mkdir -p docker-data/models
+# Copy your .pth/.index into docker-data/models, then edit docker.env.
+
+docker compose -f docker-compose.gpu.yml build
+docker compose -f docker-compose.gpu.yml run --rm trainer
+```
+
+The host folder keeps the generated dataset, warm-start checkpoint, Lightning checkpoints, downloaded base Piper voices and final model even after the container/image is deleted. The final files are copied to:
+
+```text
+docker-data/output/<voice-name>/<voice-name>.onnx
+docker-data/output/<voice-name>/<voice-name>.onnx.json
+```
+
+`BASE_PIPER_VOICE=en_GB-alba-medium` is the default. Change it to `en_US-amy-medium`, use another Piper voice key, or provide a custom ONNX/JSON pair through `docker.env`. High-pitch settings such as `PITCH=12` use the same cleanup and Piper warm-start workflow as the Windows/Colab paths.
+
+See **docker/README.md** for GPU requirements, Windows PowerShell commands, resume behavior, preflight testing and the persistent folder layout.
 
 ## Google Colab GPU build
 
@@ -130,12 +154,12 @@ text corpus → Piper base speech → RVC dataset → Piper training → .onnx +
 
 ## Requirements and notes
 
-- Windows 10 or 11, 64-bit for the desktop Studio; Google Colab is available for cloud-GPU training
-- Several GB of free disk space; RVC, Piper training, PyTorch, datasets, caches, and checkpoints can become large
-- NVIDIA GPU recommended for practical training speed; CPU training is supported by the setup script but can be very slow
+- Windows 10 or 11, 64-bit for the desktop Studio; Google Colab and NVIDIA Docker are available for headless GPU training
+- Several GB of free disk space; RVC, Piper training, PyTorch, datasets, caches and checkpoints can become large
+- NVIDIA GPU recommended for practical training speed; CPU training is supported by the Windows setup script but can be very slow
 - Piper's official docs report training success with GPUs around 8 GB VRAM, while larger GPUs give more headroom
 - Only use voice models and voices you have permission to use
-- `training/`, `models/`, `tools/`, generated audio, and local settings are ignored by Git
+- `training/`, `models/`, `tools/`, generated audio and local settings are ignored by Git
 - The stable standalone Piper runtime remains isolated under `tools/piper`; model training uses the maintained `OHF-Voice/piper1-gpl` trainer in its own environment
 
 If setup is interrupted, run **Easy Setup.cmd** or the relevant Piper trainer setup again. Existing downloads and generated dataset files are reused where possible.
