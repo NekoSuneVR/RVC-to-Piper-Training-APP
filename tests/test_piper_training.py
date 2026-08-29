@@ -61,33 +61,41 @@ class PiperTrainingTests(unittest.TestCase):
     def test_latest_checkpoint_falls_back_to_newest(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            older = root / "a.ckpt"
-            newer = root / "nested" / "b.ckpt"
+            older = root / "old" / "a.ckpt"
+            newer = root / "new" / "b.ckpt"
+            older.parent.mkdir()
             newer.parent.mkdir()
             older.write_text("a")
             newer.write_text("b")
-            older.touch()
             import os, time
             old_time = time.time() - 20
             os.utime(older, (old_time, old_time))
             self.assertEqual(latest_checkpoint(root), newer)
 
-    def test_latest_checkpoint_prefers_best_val_mel(self):
+    def test_latest_checkpoint_prefers_best_val_mel_in_newest_run(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            checkpoints = root / "lightning_logs" / "version_0" / "checkpoints"
-            checkpoints.mkdir(parents=True)
-            worse = checkpoints / "epoch=9-val_mel=0.4200.ckpt"
-            best = checkpoints / "epoch=7-val_mel=0.3100.ckpt"
-            last = checkpoints / "last.ckpt"
-            worse.write_text("worse")
-            best.write_text("best")
-            last.write_text("newest")
+            old_run = root / "lightning_logs" / "version_0" / "checkpoints"
+            new_run = root / "lightning_logs" / "version_1" / "checkpoints"
+            old_run.mkdir(parents=True)
+            new_run.mkdir(parents=True)
+
+            old_best = old_run / "epoch=99-val_mel=0.1000.ckpt"
+            old_last = old_run / "last.ckpt"
+            new_worse = new_run / "epoch=9-val_mel=0.4200.ckpt"
+            new_best = new_run / "epoch=7-val_mel=0.3100.ckpt"
+            new_last = new_run / "last.ckpt"
+            for path in (old_best, old_last, new_worse, new_best, new_last):
+                path.write_text(path.name)
 
             import os, time
-            old_time = time.time() - 30
-            os.utime(best, (old_time, old_time))
-            self.assertEqual(latest_checkpoint(root), best)
+            old_time = time.time() - 60
+            os.utime(old_best, (old_time, old_time))
+            os.utime(old_last, (old_time, old_time))
+
+            # Even though the old run has a numerically better val_mel, export
+            # must use the best validation checkpoint from the newest rebuild.
+            self.assertEqual(latest_checkpoint(root), new_best)
 
     def test_metadata_writer_uses_pipe_format(self):
         with tempfile.TemporaryDirectory() as raw:
