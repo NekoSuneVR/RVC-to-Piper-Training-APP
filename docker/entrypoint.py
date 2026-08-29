@@ -47,24 +47,62 @@ def run(command: list[str], *, cwd: Path | None = None, check: bool = True) -> i
     return result.returncode
 
 
-def check_gpu() -> None:
-    print("=== Docker GPU check ===", flush=True)
-    run(["nvidia-smi"], check=True)
+def torch_cuda_available(python: Path) -> bool:
+    return (
+        subprocess.run(
+            [str(python), "-c", "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def print_runtime(label: str, python: Path) -> None:
+    run(
+        [
+            str(python),
+            "-c",
+            (
+                "import torch; "
+                f"print('{label} torch:', torch.__version__); "
+                "print('CUDA runtime:', torch.version.cuda); "
+                "print('CUDA available:', torch.cuda.is_available()); "
+                "print('device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+            ),
+        ]
+    )
+
+
+def check_compute() -> str:
+    requested = env("COMPUTE", "auto").lower()
+    if requested not in {"auto", "cpu", "gpu"}:
+        raise RuntimeError("COMPUTE must be auto, cpu, or gpu")
+
+    if requested == "gpu":
+        print("=== Docker GPU check ===", flush=True)
+        if shutil.which("nvidia-smi") is None:
+            raise RuntimeError("COMPUTE=gpu but nvidia-smi is not available in the container")
+        run(["nvidia-smi"])
+        for label, python in (("RVC", RVC_PYTHON), ("Piper", PIPER_PYTHON)):
+            print_runtime(label, python)
+            if not torch_cuda_available(python):
+                raise RuntimeError(f"COMPUTE=gpu but {label} PyTorch cannot access CUDA")
+        return "gpu"
+
+    if requested == "auto":
+        has_gpu = torch_cuda_available(RVC_PYTHON) and torch_cuda_available(PIPER_PYTHON)
+        selected = "gpu" if has_gpu else "cpu"
+    else:
+        selected = "cpu"
+
+    print(f"=== Docker compute check: {selected.upper()} ===", flush=True)
     for label, python in (("RVC", RVC_PYTHON), ("Piper", PIPER_PYTHON)):
-        run(
-            [
-                str(python),
-                "-c",
-                (
-                    "import torch; "
-                    f"print('{label} torch:', torch.__version__); "
-                    "print('CUDA runtime:', torch.version.cuda); "
-                    "print('CUDA available:', torch.cuda.is_available()); "
-                    "print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE'); "
-                    "assert torch.cuda.is_available(), 'CUDA is not available inside the container'"
-                ),
-            ]
-        )
+        print_runtime(label, python)
+    if selected == "cpu":
+        print("CPU-only mode selected. RVC conversion and Piper training will both run on CPU.", flush=True)
+    return selected
 
 
 def download(url: str, destination: Path) -> Path:
@@ -140,7 +178,7 @@ def resolve_base_voice() -> tuple[Path, Path, str]:
     return model, config, voice_key
 
 
-def build_pipeline_args() -> tuple[list[str], str]:
+def build_pipeline_args(accelerator: str) -> tuple[list[str], str]:
     voice_name = env("VOICE_NAME", "en_GB-rvc-custom-medium")
     rvc_model = data_path(env("RVC_MODEL", "models/voice.pth"))
     rvc_index_raw = env("RVC_INDEX")
@@ -181,6 +219,7 @@ def build_pipeline_args() -> tuple[list[str], str]:
         "--checkpoint-every", env("CHECKPOINT_EVERY", "5"),
         "--num-workers", env("NUM_WORKERS", "2"),
         "--espeak-voice", env("ESPEAK_VOICE", "en-GB-x-rp"),
+        "--accelerator", accelerator,
         "--base-model", str(base_model),
         "--base-config", str(base_config),
     ]
@@ -197,6 +236,7 @@ def build_pipeline_args() -> tuple[list[str], str]:
     print(f"RVC index:   {rvc_index or 'none'}", flush=True)
     print(f"Base Piper:  {base_key}", flush=True)
     print(f"Pitch:       {env('PITCH', '12')}", flush=True)
+    print(f"Compute:     {accelerator}", flush=True)
     print(f"Work root:   {WORK_ROOT}", flush=True)
     print(f"Output root: {OUTPUT_ROOT}", flush=True)
     return args, voice_name
@@ -253,8 +293,8 @@ def main() -> int:
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-    check_gpu()
-    args, voice_name = build_pipeline_args()
+    accelerator = check_compute()
+    args, voice_name = build_pipeline_args(accelerator)
 
     if command in {"preflight", "build"} and env_bool("RUN_PREFLIGHT", True):
         run_preflight(args)
