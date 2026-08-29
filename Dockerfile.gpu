@@ -104,7 +104,18 @@ RUN /opt/piper-venv/bin/python -m pip install --upgrade \
        'scipy==1.13.1' \
        'ml-dtypes==0.5.1' \
        'onnx==1.17.0' \
-    && /opt/piper-venv/bin/python -m pip install -e '/opt/piper1-gpl[train]'
+       'lightning==2.4.0' \
+       'pytorch-lightning==2.4.0' \
+       'torchmetrics==1.4.3' \
+    && /opt/piper-venv/bin/python -m pip install -e '/opt/piper1-gpl[train]' \
+    && /opt/piper-venv/bin/python -m pip install --upgrade --force-reinstall --no-deps \
+       'numpy==1.26.4' \
+       'scipy==1.13.1' \
+       'ml-dtypes==0.5.1' \
+       'onnx==1.17.0' \
+       'lightning==2.4.0' \
+       'pytorch-lightning==2.4.0' \
+       'torchmetrics==1.4.3'
 
 RUN cd /opt/piper1-gpl \
     && /opt/piper-venv/bin/python setup.py build_ext --inplace \
@@ -113,6 +124,11 @@ RUN cd /opt/piper1-gpl \
     && rm -f core.c core*.so monotonic_align/core*.so \
     && /opt/piper-venv/bin/cythonize -i core.pyx \
     && mv core*.so monotonic_align/
+
+RUN /opt/rvc-venv/bin/python -m pip check \
+    && /opt/piper-venv/bin/python -m pip check \
+    && /opt/rvc-venv/bin/python -c "import torch,numpy,scipy,librosa,soundfile,faiss; print('RVC environment OK', torch.__version__)" \
+    && /opt/piper-venv/bin/python -c "import torch,numpy,scipy,piper.train; print('Piper environment OK', torch.__version__)"
 
 WORKDIR /app
 COPY . /app
