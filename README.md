@@ -1,6 +1,6 @@
 # RVC + Piper Studio
 
-A local Windows app that turns text into speech with Piper, applies an RVC voice model, and can now build a native Piper voice from the RVC result.
+A local Windows app that turns text into speech with Piper, applies an RVC voice model, and can now build a native Piper voice from the RVC result. A headless Google Colab notebook is also included for cloud-GPU model building.
 
 New user? Start with **FIRST-VOICE-GUIDE.md** for the exact files to obtain and a pitch-tuning walkthrough.
 
@@ -21,7 +21,30 @@ For NVIDIA RVC inference setup, open PowerShell in this folder and run:
 .\setup.ps1 -Engine cuda
 ```
 
-Generated WAV files are saved under `generated`. Audio, text, and models never leave the PC.
+Generated WAV files are saved under `generated`. Audio, text, and models never leave the PC unless you deliberately use the Colab workflow described below.
+
+## Google Colab GPU build
+
+If local Piper training is too slow, use the included notebook:
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/NekoSuneVR/RVC-to-Piper-Training-APP/blob/main/colab/RVC_to_Piper_Training_Colab.ipynb)
+
+The Colab notebook is a headless version of the builder. It mounts Google Drive, loads your RVC `.pth` and optional `.index`, generates/resumes the RVC dataset, keeps high-pitch settings such as `+12`, runs the same high-pitch audio mastering, warm-starts Piper from a medium checkpoint, trains on the Colab GPU, exports the best `val_mel` checkpoint, and saves the final `.onnx` + `.onnx.json` back to Drive.
+
+Persistent Colab data is stored under a Drive folder such as:
+
+```text
+MyDrive/RVC-Piper-Colab/
+├── models/
+│   ├── my-voice.pth
+│   └── my-voice.index
+├── _checkpoints/
+└── <voice-name>/
+    ├── dataset/
+    └── piper/
+```
+
+The Colab path also resumes from the newest `last.ckpt` after a reconnect when possible. Colab controls GPU availability and session duration, so a particular GPU or uninterrupted session cannot be guaranteed. See **colab/README.md** for the workflow details.
 
 ## Build a real Piper model from the RVC voice
 
@@ -60,6 +83,8 @@ Dataset generation is resumable. Existing WAV files are reused when their matchi
 
 The bundled prompt set is useful for testing the pipeline. For a better final model, provide a much larger clean text corpus with one sentence per line. More varied, correctly pronounced training audio generally gives Piper more useful material to learn from.
 
+For large RVC shifts such as `+12`, the trainer automatically masters the generated WAVs to mono 22.05 kHz, reduces broadband RVC hiss/top-end artifacts, invalidates the old Piper audio cache, and warm-starts from a medium Piper checkpoint when no other resume/warm-start checkpoint was supplied.
+
 ### 3. Train Piper
 
 Set the voice name, eSpeak language, device, batch size, and maximum epochs, then click **2. Train Piper**.
@@ -76,7 +101,7 @@ Use **Stop** if you need to end the current build. Checkpoints already written b
 
 ### 4. Export the voice
 
-Click **3. Export ONNX**. The builder finds the newest `.ckpt` and runs Piper's ONNX exporter.
+Click **3. Export ONNX**. The builder selects the best `val_mel` checkpoint from the newest training run (with a newest-checkpoint fallback when no scored checkpoint exists) and runs Piper's ONNX exporter.
 
 The final files are:
 
@@ -105,7 +130,7 @@ text corpus → Piper base speech → RVC dataset → Piper training → .onnx +
 
 ## Requirements and notes
 
-- Windows 10 or 11, 64-bit
+- Windows 10 or 11, 64-bit for the desktop Studio; Google Colab is available for cloud-GPU training
 - Several GB of free disk space; RVC, Piper training, PyTorch, datasets, caches, and checkpoints can become large
 - NVIDIA GPU recommended for practical training speed; CPU training is supported by the setup script but can be very slow
 - Piper's official docs report training success with GPUs around 8 GB VRAM, while larger GPUs give more headroom
