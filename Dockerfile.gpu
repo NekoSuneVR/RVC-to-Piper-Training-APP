@@ -1,0 +1,125 @@
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG RVC_REF=main
+ARG PIPER_REF=main
+ARG TORCH_VERSION=2.3.1
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu118
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    RVC_ROOT=/opt/rvc \
+    PIPER_ROOT=/opt/piper1-gpl \
+    RVC_PYTHON=/opt/rvc-venv/bin/python \
+    PIPER_PYTHON=/opt/piper-venv/bin/python \
+    RVC_PIPER_WORK_ROOT=/tmp/rvc-piper-work \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      ffmpeg \
+      git \
+      build-essential \
+      cmake \
+      ninja-build \
+      pkg-config \
+      libsndfile1 \
+      python3 \
+      python3-dev \
+      python3-pip \
+      python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/rvc-venv \
+    && python3 -m venv /opt/piper-venv
+
+# RVC runtime. CUDA 11.8 + Torch 2.3.1 keeps support for older NVIDIA
+# architectures while still working on common T4/A10/A100-class hosts.
+RUN /opt/rvc-venv/bin/python -m pip install --upgrade pip 'setuptools<81' wheel \
+    && /opt/rvc-venv/bin/python -m pip install \
+       --index-url "${TORCH_INDEX_URL}" \
+       "torch==${TORCH_VERSION}+cu118" \
+       "torchaudio==${TORCH_VERSION}+cu118" \
+    && /opt/rvc-venv/bin/python -m pip install \
+       'numpy==1.26.4' \
+       'scipy==1.13.1' \
+       'librosa>=0.10.2,<0.11' \
+       'soundfile>=0.13,<1' \
+       'faiss-cpu>=1.9,<2' \
+       'praat-parselmouth>=0.4.5,<1' \
+       'PyYAML>=6' \
+       'scikit-learn>=1.6,<2' \
+       'torchfcpe>=0.0.4,<0.1' \
+       'transformers>=4.49,<4.50' \
+       'ffmpeg-python>=0.2,<1' \
+       'av>=14,<16' \
+       'einops>=0.8,<1' \
+       'local-attention>=1.11,<2' \
+       'huggingface_hub>=0.24' \
+       'packaging>=24,<26'
+
+RUN git clone --depth 1 --branch "${RVC_REF}" \
+      https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git /opt/rvc
+
+RUN mkdir -p /opt/rvc/assets/rmvpe \
+    && /opt/rvc-venv/bin/python - <<'PY'
+from pathlib import Path
+import urllib.request
+from huggingface_hub import snapshot_download
+
+root = Path('/opt/rvc')
+rmvpe = root / 'assets' / 'rmvpe' / 'rmvpe.pt'
+if not rmvpe.is_file():
+    print('Downloading RMVPE...')
+    urllib.request.urlretrieve(
+        'https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt?download=true',
+        rmvpe,
+    )
+
+hubert = root / 'assets' / 'hubert_base'
+if not (hubert / 'config.json').is_file():
+    print('Downloading HuBERT/ContentVec...')
+    snapshot_download(
+        repo_id='lj1995/VoiceConversionWebUI',
+        allow_patterns=['hubert_base/*'],
+        local_dir=str(root / 'assets'),
+    )
+PY
+
+# Maintained Piper trainer/inference runtime in an isolated environment.
+RUN git clone --depth 1 --branch "${PIPER_REF}" \
+      https://github.com/OHF-Voice/piper1-gpl.git /opt/piper1-gpl
+
+RUN /opt/piper-venv/bin/python -m pip install --upgrade \
+      pip 'setuptools<82' wheel scikit-build 'cmake>=3.26,<4' ninja 'cython>=3,<4' \
+    && /opt/piper-venv/bin/python -m pip install \
+       --index-url "${TORCH_INDEX_URL}" \
+       "torch==${TORCH_VERSION}+cu118" \
+       "torchaudio==${TORCH_VERSION}+cu118" \
+    && /opt/piper-venv/bin/python -m pip install \
+       'numpy==1.26.4' \
+       'scipy==1.13.1' \
+       'ml-dtypes==0.5.1' \
+       'onnx==1.17.0' \
+    && /opt/piper-venv/bin/python -m pip install -e '/opt/piper1-gpl[train]'
+
+RUN cd /opt/piper1-gpl \
+    && /opt/piper-venv/bin/python setup.py build_ext --inplace \
+    && cd /opt/piper1-gpl/src/piper/train/vits/monotonic_align \
+    && mkdir -p monotonic_align \
+    && rm -f core.c core*.so monotonic_align/core*.so \
+    && /opt/piper-venv/bin/cythonize -i core.pyx \
+    && mv core*.so monotonic_align/
+
+WORKDIR /app
+COPY . /app
+
+RUN mkdir -p /data/models /data/cache /data/work /data/output /tmp/rvc-piper-work
+
+VOLUME ["/data"]
+
+ENTRYPOINT ["python3", "/app/docker/entrypoint.py"]
+CMD ["build"]
