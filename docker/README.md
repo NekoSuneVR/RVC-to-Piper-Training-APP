@@ -1,8 +1,13 @@
-# RVC → Piper Docker GPU Trainer
+# RVC → Piper Docker Trainer
 
 This Docker workflow runs the headless RVC → Piper builder without Google Colab or Google Drive.
 
-The container contains CUDA/PyTorch, RVC, RMVPE/HuBERT, Piper and the Studio training code. Large and persistent files live on the host under `docker-data/` and are mounted into the container at `/data`.
+Two images are provided:
+
+- `Dockerfile.cpu` + `docker-compose.cpu.yml` for Linux servers with no GPU.
+- `Dockerfile.gpu` + `docker-compose.gpu.yml` for NVIDIA GPU hosts.
+
+The container contains RVC, RMVPE/HuBERT, Piper and the Studio training code. Large/persistent files live on the host under `docker-data/` and are mounted at `/data`.
 
 ## Persistent layout
 
@@ -12,37 +17,22 @@ docker-data/
 │   ├── Neeko.pth
 │   └── Neeko.index
 ├── cache/
-│   └── base-voices/          # downloaded Piper base voices
+│   └── base-voices/
 ├── work/
-│   ├── _checkpoints/         # warm-start checkpoint
+│   ├── _checkpoints/
 │   └── <voice-name>/
 │       ├── dataset/
 │       └── piper/
-│           └── training/     # Lightning checkpoints
+│           └── training/
 └── output/
     └── <voice-name>/
         ├── <voice-name>.onnx
         └── <voice-name>.onnx.json
 ```
 
-Deleting/rebuilding the Docker image does not delete `docker-data/`.
+Deleting or rebuilding the Docker image does not delete `docker-data/`.
 
-## Requirements
-
-- Docker Engine or Docker Desktop with Compose v2
-- An NVIDIA GPU exposed to Docker
-- NVIDIA Container Toolkit on Linux, or a Docker Desktop configuration that supports NVIDIA GPU passthrough
-- Plenty of local disk space. The image plus CUDA/PyTorch/RVC/Piper assets is large, and training checkpoints/datasets add more space. Around 30 GB free is a practical minimum; more is better for long training runs.
-
-Check GPU access first:
-
-```bash
-docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
-```
-
-If this fails, fix Docker GPU access before building the trainer.
-
-## Quick start
+## Common setup
 
 From the repository root:
 
@@ -51,134 +41,116 @@ cp docker.env.example docker.env
 mkdir -p docker-data/models
 ```
 
-Copy your RVC model and optional index into `docker-data/models/`, for example:
-
-```text
-docker-data/models/Neeko.pth
-docker-data/models/Neeko.index
-```
-
-Edit `docker.env` as needed. The important defaults are:
+Copy the RVC model and optional index into `docker-data/models/`, then edit `docker.env`:
 
 ```env
 VOICE_NAME=en_US-nekoai-medium
 RVC_MODEL=models/Neeko.pth
 RVC_INDEX=models/Neeko.index
-BASE_PIPER_VOICE=en_GB-alba-medium
+BASE_PIPER_VOICE=en_US-amy-medium
 PITCH=12
+INDEX_RATE=0.75
+PROTECT=0.33
+F0_METHOD=rmvpe
 BATCH_SIZE=8
 MAX_EPOCHS=1000
-```
-
-Then build the image:
-
-```bash
-docker compose -f docker-compose.gpu.yml build
-```
-
-Run the complete pipeline:
-
-```bash
-docker compose -f docker-compose.gpu.yml run --rm trainer
-```
-
-The container first checks CUDA, runs a one-sentence Piper + RVC preflight, then generates/resumes the dataset, cleans high-pitch audio, fine-tunes Piper, exports the best checkpoint and copies the final ONNX pair to `docker-data/output/<voice-name>/`.
-
-## Windows PowerShell
-
-```powershell
-Copy-Item docker.env.example docker.env
-New-Item -ItemType Directory -Force docker-data\models
-Copy-Item C:\Path\To\Neeko.pth docker-data\models\Neeko.pth
-Copy-Item C:\Path\To\Neeko.index docker-data\models\Neeko.index
-
-docker compose -f docker-compose.gpu.yml build
-docker compose -f docker-compose.gpu.yml run --rm trainer
-```
-
-## Change the base Piper voice
-
-Alba is the default:
-
-```env
-BASE_PIPER_VOICE=en_GB-alba-medium
-```
-
-Amy:
-
-```env
-BASE_PIPER_VOICE=en_US-amy-medium
-```
-
-Short aliases also work:
-
-```env
-BASE_PIPER_VOICE=alba
-BASE_PIPER_VOICE=amy
-```
-
-Any key present in Piper's official `voices.json` can be used. The matching ONNX and JSON are downloaded once into `docker-data/cache/base-voices/` and reused on later runs.
-
-For your own base Piper model, place the ONNX/JSON under `docker-data/models/` and set both:
-
-```env
-BASE_PIPER_MODEL=models/custom-base.onnx
-BASE_PIPER_CONFIG=models/custom-base.onnx.json
-```
-
-## Resume after stopping or restarting
-
-Training state is persisted under `docker-data/work/`.
-
-With the default:
-
-```env
+RUN_PREFLIGHT=1
 NO_RESUME=0
 ```
 
-running the same Compose command again automatically looks for the newest `last.ckpt` and resumes when possible:
+## CPU-only Linux server
+
+No NVIDIA driver or NVIDIA Container Toolkit is required.
+
+Build:
 
 ```bash
+docker compose -f docker-compose.cpu.yml build
+```
+
+Run the one-sentence preflight only:
+
+```bash
+docker compose -f docker-compose.cpu.yml run --rm trainer preflight
+```
+
+Run the full pipeline:
+
+```bash
+docker compose -f docker-compose.cpu.yml run --rm trainer
+```
+
+The CPU image uses CPU-only PyTorch. Both RVC dataset conversion and Piper training run on the CPU.
+
+CPU training is supported but can be extremely slow. The persistent checkpoint layout is important: if the process is stopped after `last.ckpt` exists, run the same command again with `NO_RESUME=0` to resume.
+
+For a quick validation before committing to a very long CPU job, temporarily use something such as:
+
+```env
+PROMPT_LIMIT=10
+MAX_EPOCHS=1
+BATCH_SIZE=2
+```
+
+Once that completes successfully, restore the real prompt/epoch values. Do not reuse the tiny validation dataset for the final model unless that is intentional; either remove the test voice folder under `docker-data/work/` or use a different `VOICE_NAME` for the test.
+
+## NVIDIA GPU server
+
+Requirements:
+
+- Docker Engine / Compose v2
+- NVIDIA driver
+- NVIDIA Container Toolkit
+
+Check GPU passthrough:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+```
+
+Build and run:
+
+```bash
+docker compose -f docker-compose.gpu.yml build
 docker compose -f docker-compose.gpu.yml run --rm trainer
 ```
 
-To force a new warm-start training run instead:
+## What the container does
 
-```env
-NO_RESUME=1
+The build performs:
+
+```text
+selected Piper base voice
+→ base speech
+→ RVC conversion
+→ pitch (+12 is supported)
+→ persistent dataset
+→ high-pitch cleanup
+→ Piper warm-start
+→ CPU or GPU training
+→ best val_mel checkpoint
+→ ONNX export
 ```
 
-## Reuse an existing generated dataset
-
-After the dataset exists under `docker-data/work/<voice-name>/dataset`, set:
-
-```env
-SKIP_DATASET=1
-```
-
-This skips Piper-base synthesis and RVC conversion and goes directly to Piper training/resume.
-
-## Run only the preflight
-
-```bash
-docker compose -f docker-compose.gpu.yml run --rm trainer preflight
-```
-
-This tests GPU access, the selected base Piper voice, your RVC `.pth`/`.index`, RMVPE and the +12 conversion without starting the full training job.
-
-## Open a shell inside the image
-
-```bash
-docker compose -f docker-compose.gpu.yml run --rm trainer shell
-```
-
-## Output
-
-After a successful build:
+Final files are copied to:
 
 ```text
 docker-data/output/<voice-name>/<voice-name>.onnx
 docker-data/output/<voice-name>/<voice-name>.onnx.json
 ```
 
-These are ordinary host files and can be copied directly to the Windows Studio or another Piper runtime.
+## Resume
+
+Keep:
+
+```env
+NO_RESUME=0
+```
+
+and rerun the same Compose command. The builder searches the persistent training folder for the newest `last.ckpt`.
+
+Dataset WAVs are also persistent, so completed RVC conversions do not need to be regenerated when their metadata still matches.
+
+## Storage
+
+CPU mode removes the large CUDA base image, but RVC, Piper, PyTorch, the warm-start checkpoint, datasets and training checkpoints still use several GB. Keep plenty of free host disk space and mount `docker-data` on a larger disk if necessary.
