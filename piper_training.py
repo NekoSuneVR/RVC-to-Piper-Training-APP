@@ -153,13 +153,26 @@ def export_command(plan: PiperTrainPlan, checkpoint: Path) -> list[str]:
 
 
 def latest_checkpoint(root: Path) -> Path | None:
-    """Choose Piper's best val_mel checkpoint, with latest-file fallback."""
+    """Choose the best val_mel checkpoint from the newest Lightning run."""
     candidates = [p for p in root.rglob("*.ckpt") if p.is_file()]
     if not candidates:
         return None
 
-    scored: list[tuple[float, int, Path]] = []
+    # A rebuild creates a new Lightning version/checkpoint directory. Never let
+    # an older run win merely because it once achieved a numerically lower
+    # validation score. First select the checkpoint directory whose files were
+    # written most recently, then choose the best validation checkpoint there.
+    runs: dict[Path, list[Path]] = {}
     for path in candidates:
+        runs.setdefault(path.parent, []).append(path)
+
+    newest_run = max(
+        runs.values(),
+        key=lambda paths: max(path.stat().st_mtime_ns for path in paths),
+    )
+
+    scored: list[tuple[float, int, Path]] = []
+    for path in newest_run:
         match = VAL_MEL_RE.search(path.name)
         if match:
             scored.append((float(match.group(1)), -path.stat().st_mtime_ns, path))
@@ -168,7 +181,7 @@ def latest_checkpoint(root: Path) -> Path | None:
         # Lower mel L1 is better. For an exact score tie, prefer the newest.
         return min(scored, key=lambda item: (item[0], item[1]))[2]
 
-    return max(candidates, key=lambda p: p.stat().st_mtime_ns)
+    return max(newest_run, key=lambda p: p.stat().st_mtime_ns)
 
 
 def validate_trainer(plan: PiperTrainPlan) -> list[str]:
