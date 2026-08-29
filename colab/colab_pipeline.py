@@ -210,8 +210,14 @@ def main() -> int:
 
     repo_root = Path(args.repo_root).resolve()
     rvc_root = Path(args.rvc_root).resolve()
-    rvc_python = Path(args.rvc_python).resolve()
-    piper_python = Path(args.piper_python).resolve()
+
+    # uv virtual environments expose bin/python as a symlink to the managed
+    # base interpreter. Do not Path.resolve() these two paths: following that
+    # symlink loses the venv site-packages and causes imports such as piper/RVC
+    # to disappear in child processes.
+    rvc_python = Path(os.path.abspath(os.path.expanduser(args.rvc_python)))
+    piper_python = Path(os.path.abspath(os.path.expanduser(args.piper_python)))
+
     drive_root = Path(args.drive_root).resolve()
     rvc_model = Path(args.rvc_model).resolve()
     rvc_index = Path(args.rvc_index).resolve() if args.rvc_index else None
