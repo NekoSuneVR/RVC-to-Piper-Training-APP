@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -42,12 +42,23 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def absolute_without_resolving_symlink(value: str) -> Path:
+    """Make a path absolute without following uv venv interpreter symlinks."""
+
+    return Path(os.path.abspath(os.path.expanduser(value)))
+
+
 def main() -> int:
     args = parser().parse_args()
     repo = Path(args.repo_root).resolve()
     rvc_root = Path(args.rvc_root).resolve()
-    rvc_python = Path(args.rvc_python).resolve()
-    piper_python = Path(args.piper_python).resolve()
+
+    # Important: uv's venv/bin/python is a symlink to its managed interpreter.
+    # Path.resolve() would follow it and lose the virtual environment's
+    # site-packages. Keep the venv path intact when launching child Python.
+    rvc_python = absolute_without_resolving_symlink(args.rvc_python)
+    piper_python = absolute_without_resolving_symlink(args.piper_python)
+
     base_model = Path(args.base_model).resolve()
     base_config = Path(args.base_config).resolve()
     rvc_model = Path(args.rvc_model).resolve()
@@ -140,8 +151,10 @@ def main() -> int:
                 str(piper_python),
                 "-c",
                 (
-                    "import sys,torch,numpy,scipy; "
+                    "import sys,torch,numpy,scipy,piper; "
                     "print('python',sys.version.split()[0]); "
+                    "print('executable',sys.executable); "
+                    "print('piper',piper.__file__); "
                     "print('torch',torch.__version__,'cuda',torch.version.cuda); "
                     "print('gpu',torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE'); "
                     "print('numpy',numpy.__version__,'scipy',scipy.__version__)"
@@ -150,7 +163,7 @@ def main() -> int:
             cwd=repo,
         )
 
-    print("\nPRELIGHT PASSED: base Piper + RVC + CUDA runtime are working.")
+    print("\nPREFLIGHT PASSED: base Piper + RVC + CUDA runtime are working.")
     return 0
 
 
