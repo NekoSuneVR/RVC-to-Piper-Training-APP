@@ -440,7 +440,6 @@ class _ConsoleProgressCallback:
         self._write_progress(trainer, "fit_complete")
 
 
-
 def _configure_callbacks() -> None:
     callbacks = list(getattr(piper_train_main, "_DEFAULT_CALLBACKS", []))
 
@@ -476,16 +475,19 @@ def _configure_callbacks() -> None:
                     flush=True,
                 )
 
-        # Resume safety is independent from best-model cadence. last.ckpt is
-        # refreshed every epoch so a GPU quota/session cut loses at most the
-        # unfinished epoch. Full optimizer/global-step state is preserved, so
-        # the same checkpoint can be resumed on CPU or GPU.
+        # Always create a real full-state checkpoint at each epoch. The fixed
+        # filename is overwritten so repeated Colab sessions do not accumulate
+        # an unlimited number of resume checkpoints. save_last=True also keeps
+        # the deterministic last.ckpt path that the headless pipeline searches.
         resume_checkpoint = VerboseModelCheckpoint(
             dirpath=str(checkpoint_dir),
-            save_top_k=0,
+            filename="resume-latest",
+            save_top_k=-1,
             save_last=True,
             every_n_epochs=1,
             save_on_train_epoch_end=False,
+            auto_insert_metric_name=False,
+            enable_version_counter=False,
         )
         best_checkpoint = VerboseModelCheckpoint(
             dirpath=str(checkpoint_dir),
@@ -505,8 +507,13 @@ def _configure_callbacks() -> None:
             best_checkpoint,
         ]
         print(
-            "Piper Colab checkpoint mode: last.ckpt EVERY epoch for CPU/GPU resume; "
+            "Piper Colab checkpoint mode: resume-latest.ckpt + last.ckpt EVERY epoch; "
             f"best 2 val_mel every {best_every} epoch(s).",
+            flush=True,
+        )
+        print(
+            "Full checkpoint state includes model weights, optimizer state, epoch and global step; "
+            "it can resume on CPU after a GPU session ends.",
             flush=True,
         )
         print(
