@@ -50,14 +50,15 @@ class PiperTrainingTests(unittest.TestCase):
             self.assertEqual(command[1], str(TRAIN_WRAPPER))
             self.assertEqual(command[2], "fit")
             self.assertIn("--data.csv_path", command)
-            self.assertIn("--ckpt_path", command)
+            self.assertIn("--model.warmstart_ckpt", command)
+            self.assertNotIn("--ckpt_path", command)
             voice_index = command.index("--data.espeak_voice") + 1
             self.assertEqual(command[voice_index], "en-GB-x-rp")
             export = export_command(plan, root / "last.ckpt")
             self.assertEqual(export[1:3], ["-m", "piper.train.export_onnx"])
             self.assertIn(str(plan.onnx_path), export)
 
-    def test_latest_checkpoint_prefers_newest(self):
+    def test_latest_checkpoint_falls_back_to_newest(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             older = root / "a.ckpt"
@@ -70,6 +71,23 @@ class PiperTrainingTests(unittest.TestCase):
             old_time = time.time() - 20
             os.utime(older, (old_time, old_time))
             self.assertEqual(latest_checkpoint(root), newer)
+
+    def test_latest_checkpoint_prefers_best_val_mel(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            checkpoints = root / "lightning_logs" / "version_0" / "checkpoints"
+            checkpoints.mkdir(parents=True)
+            worse = checkpoints / "epoch=9-val_mel=0.4200.ckpt"
+            best = checkpoints / "epoch=7-val_mel=0.3100.ckpt"
+            last = checkpoints / "last.ckpt"
+            worse.write_text("worse")
+            best.write_text("best")
+            last.write_text("newest")
+
+            import os, time
+            old_time = time.time() - 30
+            os.utime(best, (old_time, old_time))
+            self.assertEqual(latest_checkpoint(root), best)
 
     def test_metadata_writer_uses_pipe_format(self):
         with tempfile.TemporaryDirectory() as raw:
