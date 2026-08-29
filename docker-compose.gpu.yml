@@ -1,0 +1,13 @@
+services:
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    image: rvc-piper-trainer:cuda118
+    gpus: all
+    shm_size: "8gb"
+    env_file:
+      - docker.env
+    volumes:
+      - ./docker-data:/data
+    restart: "no"
