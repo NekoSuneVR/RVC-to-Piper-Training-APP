@@ -1,19 +1,319 @@
 from __future__ import annotations
 
-"""Run Piper training without the optional MOS checkpoint callback.
+"""Run Piper training with Studio compatibility and high-pitch safeguards.
 
-Piper's current training CLI registers two ModelCheckpoint callbacks: one for
-val_mel and one for the optional val_mos/UTMOS metric. On some Lightning
-versions, if the optional MOS predictor cannot be loaded, val_mos is never
-logged and ModelCheckpoint raises instead of skipping the callback. The Studio
-only needs reliable val_mel/last checkpoints, so remove the optional callback
-before delegating to Piper's normal CLI.
+This wrapper keeps Piper's reliable ``val_mel``/``last.ckpt`` checkpointing,
+disables the optional UTMOS checkpoint path that is not available in the
+portable trainer, and prepares high-pitch RVC datasets before training.
+
+For large RVC pitch shifts (10 semitones or more), the generated WAVs are
+mastered to Piper's native 22.05 kHz format before librosa caches them. The
+profile removes low-frequency rumble, suppresses broadband RVC hiss, rolls off
+the unusable top octave, and leaves headroom. Existing Piper audio/spectrogram
+cache files are deleted whenever this mastering pass changes the dataset.
+
+High-pitch builds also warm-start from the official Piper medium Lessac
+checkpoint when the user did not choose a checkpoint. The current Piper VITS
+model supports ``model.warmstart_ckpt``, which copies matching pretrained model
+weights but starts a fresh optimizer/epoch schedule. This avoids trying to
+learn an entire VITS/vocoder stack from a very small synthetic dataset.
 """
+
+import json
+import pathlib
+import shutil
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+# Older official Piper checkpoints may contain pathlib.PosixPath metadata.
+# Let torch.load unpickle those checkpoints on Windows.
+if sys.platform == "win32":
+    pathlib.PosixPath = pathlib.WindowsPath
 
 from piper.train import __main__ as piper_train_main
 
 
+APP_DIR = Path(__file__).resolve().parent
+SETTINGS_FILE = APP_DIR / "data" / "settings.json"
+HIGH_PITCH_THRESHOLD = 10
+CLEAN_PROFILE_VERSION = "piper-high-pitch-clean-v1"
+CLEAN_FILTER = (
+    "highpass=f=70,"
+    "lowpass=f=9000,"
+    "afftdn=nr=10:nf=-35,"
+    "aresample=22050,"
+    "volume=0.95"
+)
+FALLBACK_CLEAN_FILTER = (
+    "highpass=f=70,"
+    "lowpass=f=9000,"
+    "aresample=22050,"
+    "volume=0.95"
+)
+
+WARMSTART_DIR = APP_DIR / "models" / "piper" / "checkpoints"
+WARMSTART_CHECKPOINT = WARMSTART_DIR / "en_US-lessac-medium.ckpt"
+WARMSTART_URL = (
+    "https://huggingface.co/datasets/rhasspy/piper-checkpoints/resolve/main/"
+    "en/en_US/lessac/medium/epoch%3D2164-step%3D1355540.ckpt?download=true"
+)
+
+
+def _arg_value(name: str) -> str | None:
+    try:
+        index = sys.argv.index(name)
+    except ValueError:
+        return None
+    if index + 1 >= len(sys.argv):
+        return None
+    return sys.argv[index + 1]
+
+
+def _has_any_arg(*names: str) -> bool:
+    return any(name in sys.argv for name in names)
+
+
+def _studio_pitch() -> int:
+    try:
+        raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        return int(raw.get("pitch", 0))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 0
+
+
+def _find_ffmpeg() -> Path | None:
+    bundled = APP_DIR / "tools" / "rvc" / "ffmpeg.exe"
+    if bundled.is_file():
+        return bundled
+    found = shutil.which("ffmpeg")
+    return Path(found) if found else None
+
+
+def _dataset_needs_cleaning(audio_dir: Path, marker: Path, pitch: int) -> bool:
+    wavs = [path for path in audio_dir.glob("*.wav") if path.is_file()]
+    if not wavs:
+        return False
+    if not marker.is_file():
+        return True
+    try:
+        info = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return True
+    if info.get("profile") != CLEAN_PROFILE_VERSION or int(info.get("pitch", 9999)) != pitch:
+        return True
+    if int(info.get("files", -1)) != len(wavs):
+        return True
+    try:
+        marker_time = marker.stat().st_mtime_ns
+        return any(path.stat().st_mtime_ns > marker_time for path in wavs)
+    except OSError:
+        return True
+
+
+def _clean_high_pitch_dataset(pitch: int) -> None:
+    audio_raw = _arg_value("--data.audio_dir")
+    cache_raw = _arg_value("--data.cache_dir")
+    if not audio_raw:
+        return
+
+    audio_dir = Path(audio_raw)
+    if not audio_dir.is_dir():
+        return
+
+    marker = audio_dir.parent / ".piper-audio-master.json"
+    if not _dataset_needs_cleaning(audio_dir, marker, pitch):
+        print(
+            f"Piper Studio {pitch:+d} audio mastering: current; reusing cleaned dataset.",
+            flush=True,
+        )
+        return
+
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg is None:
+        raise RuntimeError(
+            "High-pitch Piper training needs FFmpeg for dataset cleanup, but "
+            "tools\\rvc\\ffmpeg.exe was not found. Run Easy Setup again."
+        )
+
+    wavs = sorted(path for path in audio_dir.glob("*.wav") if path.is_file())
+    if not wavs:
+        return
+
+    print(
+        f"Piper Studio high-pitch mode: keeping RVC pitch {pitch:+d} and mastering "
+        f"{len(wavs)} WAV files for clean 22.05 kHz Piper training...",
+        flush=True,
+    )
+    print(
+        "Audio cleanup: 70 Hz high-pass, RVC hiss reduction, 9 kHz low-pass, "
+        "mono 22050 Hz, 5% headroom.",
+        flush=True,
+    )
+
+    for number, wav_path in enumerate(wavs, start=1):
+        temp_path = wav_path.with_name(wav_path.stem + ".piper-clean.tmp.wav")
+
+        def run_filter(filter_chain: str) -> subprocess.CompletedProcess[str]:
+            temp_path.unlink(missing_ok=True)
+            command = [
+                str(ffmpeg),
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(wav_path),
+                "-af",
+                filter_chain,
+                "-ar",
+                "22050",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                str(temp_path),
+            ]
+            return subprocess.run(command, capture_output=True, text=True, check=False)
+
+        try:
+            result = run_filter(CLEAN_FILTER)
+            if result.returncode != 0:
+                # Some minimal FFmpeg builds omit afftdn. Keep the important
+                # anti-alias/high-frequency cleanup instead of failing setup.
+                result = run_filter(FALLBACK_CLEAN_FILTER)
+
+            if result.returncode != 0 or not temp_path.is_file() or temp_path.stat().st_size == 0:
+                detail = (result.stderr or result.stdout or "FFmpeg returned no diagnostic").strip()
+                raise RuntimeError(
+                    f"Could not clean {wav_path.name}: {detail[-2000:]}"
+                )
+            temp_path.replace(wav_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+
+        if number == 1 or number == len(wavs) or (number % 10) == 0:
+            print(f"  mastered {number}/{len(wavs)}: {wav_path.name}", flush=True)
+
+    marker.write_text(
+        json.dumps(
+            {
+                "profile": CLEAN_PROFILE_VERSION,
+                "pitch": pitch,
+                "files": len(wavs),
+                "sample_rate": 22050,
+                "lowpass_hz": 9000,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    if cache_raw:
+        cache_dir = Path(cache_raw)
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+            print(
+                "Deleted Piper audio/spectrogram cache so training uses the newly "
+                "mastered high-pitch dataset.",
+                flush=True,
+            )
+
+
+def _download_warmstart() -> Path:
+    if WARMSTART_CHECKPOINT.is_file() and WARMSTART_CHECKPOINT.stat().st_size > 100_000_000:
+        return WARMSTART_CHECKPOINT
+
+    WARMSTART_DIR.mkdir(parents=True, exist_ok=True)
+    part = WARMSTART_CHECKPOINT.with_suffix(".ckpt.part")
+    part.unlink(missing_ok=True)
+
+    print(
+        "High-pitch Piper build has no warm-start checkpoint. Downloading the "
+        "official Piper medium Lessac checkpoint (~846 MB) once...",
+        flush=True,
+    )
+    request = urllib.request.Request(
+        WARMSTART_URL,
+        headers={"User-Agent": "RVC-Piper-Studio/1.0"},
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response, part.open("wb") as handle:
+            total = int(response.headers.get("Content-Length") or 0)
+            copied = 0
+            next_report = 64 * 1024 * 1024
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                copied += len(chunk)
+                if copied >= next_report:
+                    if total > 0:
+                        print(
+                            f"  warm-start download: {copied / 1024**2:.0f} / "
+                            f"{total / 1024**2:.0f} MB",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"  warm-start download: {copied / 1024**2:.0f} MB",
+                            flush=True,
+                        )
+                    next_report += 64 * 1024 * 1024
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+
+    if not part.is_file() or part.stat().st_size < 100_000_000:
+        part.unlink(missing_ok=True)
+        raise RuntimeError("Warm-start checkpoint download was incomplete.")
+
+    part.replace(WARMSTART_CHECKPOINT)
+    print(f"Warm-start checkpoint ready: {WARMSTART_CHECKPOINT}", flush=True)
+    return WARMSTART_CHECKPOINT
+
+
+def _enable_high_pitch_warmstart(pitch: int) -> None:
+    if _has_any_arg(
+        "--ckpt_path",
+        "--model.warmstart_ckpt",
+        "--model.vocoder_warmstart_ckpt",
+    ):
+        return
+
+    checkpoint = _download_warmstart()
+    sys.argv.extend(["--model.warmstart_ckpt", str(checkpoint)])
+    print(
+        "Piper Studio high-pitch warm-start: loading matching pretrained VITS "
+        "weights with a fresh optimizer (not resuming the old checkpoint epoch).",
+        flush=True,
+    )
+
+
+def _prepare_training() -> None:
+    if len(sys.argv) < 2 or sys.argv[1] != "fit":
+        return
+
+    # The MOS checkpoint callback is removed below, so avoid loading/downloading
+    # the optional UTMOS predictor as well.
+    if not _has_any_arg("--model.mos_metric"):
+        sys.argv.extend(["--model.mos_metric", "none"])
+
+    pitch = _studio_pitch()
+    if abs(pitch) < HIGH_PITCH_THRESHOLD:
+        return
+
+    _clean_high_pitch_dataset(pitch)
+    _enable_high_pitch_warmstart(pitch)
+
+
 def main() -> None:
+    _prepare_training()
+
     callbacks = list(getattr(piper_train_main, "_DEFAULT_CALLBACKS", []))
     piper_train_main._DEFAULT_CALLBACKS = [
         callback
