@@ -1,25 +1,21 @@
 from __future__ import annotations
 
-"""Run Piper training with Studio compatibility and high-pitch safeguards.
+"""Run Piper training with Studio/Colab compatibility and high-pitch safeguards.
 
-This wrapper keeps Piper's reliable ``val_mel``/``last.ckpt`` checkpointing,
-disables the optional UTMOS checkpoint path that is not available in the
-portable trainer, and prepares high-pitch RVC datasets before training.
+For RVC pitch shifts of 10 semitones or more, the generated WAV dataset is
+mastered to Piper's native 22.05 kHz format before librosa caches it. The
+profile removes rumble, suppresses broadband hiss, rolls off unusable top-end
+energy, and leaves headroom.
 
-For large RVC pitch shifts (10 semitones or more), the generated WAVs are
-mastered to Piper's native 22.05 kHz format before librosa caches them. The
-profile removes low-frequency rumble, suppresses broadband RVC hiss, rolls off
-the unusable top octave, and leaves headroom. Existing Piper audio/spectrogram
-cache files are deleted whenever this mastering pass changes the dataset.
+High-pitch builds warm-start from an official Piper medium checkpoint when no
+resume/warm-start argument is already present. The optional UTMOS checkpoint is
+disabled because it is not required for training/export.
 
-High-pitch builds also warm-start from the official Piper medium Lessac
-checkpoint when the user did not choose a checkpoint. The current Piper VITS
-model supports ``model.warmstart_ckpt``, which copies matching pretrained model
-weights but starts a fresh optimizer/epoch schedule. This avoids trying to
-learn an entire VITS/vocoder stack from a very small synthetic dataset.
+Google Colab can opt into Drive-friendly checkpointing with PIPER_COLAB=1.
 """
 
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -76,6 +72,15 @@ def _has_any_arg(*names: str) -> bool:
 
 
 def _studio_pitch() -> int:
+    # Colab/headless callers can explicitly provide the pitch without needing a
+    # Windows Studio settings file.
+    env_pitch = os.environ.get("RVC_PIPER_PITCH")
+    if env_pitch not in (None, ""):
+        try:
+            return int(env_pitch)
+        except ValueError:
+            pass
+
     try:
         raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         return int(raw.get("pitch", 0))
@@ -134,7 +139,7 @@ def _clean_high_pitch_dataset(pitch: int) -> None:
     if ffmpeg is None:
         raise RuntimeError(
             "High-pitch Piper training needs FFmpeg for dataset cleanup, but "
-            "tools\\rvc\\ffmpeg.exe was not found. Run Easy Setup again."
+            "no bundled/system ffmpeg executable was found."
         )
 
     wavs = sorted(path for path in audio_dir.glob("*.wav") if path.is_file())
@@ -186,9 +191,7 @@ def _clean_high_pitch_dataset(pitch: int) -> None:
 
             if result.returncode != 0 or not temp_path.is_file() or temp_path.stat().st_size == 0:
                 detail = (result.stderr or result.stdout or "FFmpeg returned no diagnostic").strip()
-                raise RuntimeError(
-                    f"Could not clean {wav_path.name}: {detail[-2000:]}"
-                )
+                raise RuntimeError(f"Could not clean {wav_path.name}: {detail[-2000:]}")
             temp_path.replace(wav_path)
         finally:
             if temp_path.exists():
@@ -311,20 +314,51 @@ def _prepare_training() -> None:
     _enable_high_pitch_warmstart(pitch)
 
 
-def main() -> None:
-    _prepare_training()
-
+def _configure_callbacks() -> None:
     callbacks = list(getattr(piper_train_main, "_DEFAULT_CALLBACKS", []))
+
+    if os.environ.get("PIPER_COLAB", "").strip().lower() in {"1", "true", "yes", "on"}:
+        # Google Drive is far slower than a local SSD, and Piper checkpoints are
+        # large. Save fewer checkpoints, less often, while keeping a resumable
+        # last.ckpt plus the best validation checkpoints.
+        from lightning.pytorch.callbacks import ModelCheckpoint
+
+        try:
+            every_n_epochs = max(1, int(os.environ.get("PIPER_COLAB_CHECKPOINT_EVERY", "5")))
+        except ValueError:
+            every_n_epochs = 5
+
+        piper_train_main._DEFAULT_CALLBACKS = [
+            ModelCheckpoint(
+                monitor="val_mel",
+                mode="min",
+                save_top_k=2,
+                save_last=True,
+                every_n_epochs=every_n_epochs,
+                filename="epoch={epoch}-val_mel={val_mel:.4f}",
+                auto_insert_metric_name=False,
+            )
+        ]
+        print(
+            "Piper Colab checkpoint mode: best 2 val_mel + last.ckpt, "
+            f"saving every {every_n_epochs} epoch(s).",
+            flush=True,
+        )
+        return
+
     piper_train_main._DEFAULT_CALLBACKS = [
-        callback
-        for callback in callbacks
-        if getattr(callback, "monitor", None) != "val_mos"
+        callback for callback in callbacks if getattr(callback, "monitor", None) != "val_mos"
     ]
     print(
         "Piper Studio checkpoint mode: val_mel + last.ckpt "
         "(optional val_mos/UTMOS checkpoint disabled).",
         flush=True,
     )
+
+
+def main() -> None:
+    _prepare_training()
+    _configure_callbacks()
     piper_train_main.main()
 
 
